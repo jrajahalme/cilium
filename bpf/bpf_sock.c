@@ -1017,7 +1017,9 @@ static __always_inline int __sock6_xlate_fwd(struct bpf_sock_addr *ctx,
 	/* See __sock4_xlate_fwd for commentary. */
 	if (lb6_svc_is_l7loadbalancer(svc)) {
 		if (is_defined(BPF_HAVE_NETNS_COOKIE) && in_hostns) {
-			l7backend.address = { .addr[15] = 1, };
+			union v6addr loopback = { .addr[15] = 1, };
+
+			l7backend.address = loopback;
 			l7backend.port = (__be16)svc->l7_lb_proxy_port;
 			l7backend.proto = 0;
 			l7backend.pad = 0;
