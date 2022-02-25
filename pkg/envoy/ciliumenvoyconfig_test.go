@@ -160,10 +160,9 @@ func (s *JSONSuite) TestCiliumEnvoyConfig(c *C) {
 	c.Assert(resources.Listeners[0].Address.GetSocketAddress().GetPortValue(), Equals, uint32(10000))
 	c.Assert(resources.Listeners[0].FilterChains, HasLen, 1)
 	chain := resources.Listeners[0].FilterChains[0]
-	c.Assert(chain.Filters, HasLen, 2)
-	c.Assert(chain.Filters[0].Name, Equals, "cilium.network")
-	c.Assert(chain.Filters[1].Name, Equals, "envoy.filters.network.http_connection_manager")
-	message, err := chain.Filters[1].GetTypedConfig().UnmarshalNew()
+	c.Assert(chain.Filters, HasLen, 1)
+	c.Assert(chain.Filters[0].Name, Equals, "envoy.filters.network.http_connection_manager")
+	message, err := chain.Filters[0].GetTypedConfig().UnmarshalNew()
 	c.Assert(err, IsNil)
 	c.Assert(message, Not(IsNil))
 	hcm, ok := message.(*envoy_config_http.HttpConnectionManager)
@@ -190,9 +189,8 @@ func (s *JSONSuite) TestCiliumEnvoyConfig(c *C) {
 	//
 	// Check that HTTP filters are parsed
 	//
-	c.Assert(hcm.HttpFilters, HasLen, 2)
-	c.Assert(hcm.HttpFilters[0].Name, Equals, "cilium.l7policy")
-	c.Assert(hcm.HttpFilters[1].Name, Equals, "envoy.filters.http.router")
+	c.Assert(hcm.HttpFilters, HasLen, 1)
+	c.Assert(hcm.HttpFilters[0].Name, Equals, "envoy.filters.http.router")
 }
 
 var ciliumEnvoyConfigInvalid = `apiVersion: cilium.io/v2alpha1
@@ -240,10 +238,9 @@ func (s *JSONSuite) TestCiliumEnvoyConfigValidation(c *C) {
 	c.Assert(resources.Listeners[0].Address.GetSocketAddress().GetPortValue(), Equals, uint32(0)) // invalid listener port number
 	c.Assert(resources.Listeners[0].FilterChains, HasLen, 1)
 	chain := resources.Listeners[0].FilterChains[0]
-	c.Assert(chain.Filters, HasLen, 2)
-	c.Assert(chain.Filters[0].Name, Equals, "cilium.network")
-	c.Assert(chain.Filters[1].Name, Equals, "envoy.filters.network.http_connection_manager")
-	message, err := chain.Filters[1].GetTypedConfig().UnmarshalNew()
+	c.Assert(chain.Filters, HasLen, 1)
+	c.Assert(chain.Filters[0].Name, Equals, "envoy.filters.network.http_connection_manager")
+	message, err := chain.Filters[0].GetTypedConfig().UnmarshalNew()
 	c.Assert(err, IsNil)
 	c.Assert(message, Not(IsNil))
 	hcm, ok := message.(*envoy_config_http.HttpConnectionManager)
@@ -270,9 +267,8 @@ func (s *JSONSuite) TestCiliumEnvoyConfigValidation(c *C) {
 	//
 	// Check that HTTP filters are parsed
 	//
-	c.Assert(hcm.HttpFilters, HasLen, 2)
-	c.Assert(hcm.HttpFilters[0].Name, Equals, "cilium.l7policy")
-	c.Assert(hcm.HttpFilters[1].Name, Equals, "envoy.filters.http.router")
+	c.Assert(hcm.HttpFilters, HasLen, 1)
+	c.Assert(hcm.HttpFilters[0].Name, Equals, "envoy.filters.http.router")
 
 	//
 	// Same with validation fails
@@ -437,10 +433,9 @@ func (s *JSONSuite) TestCiliumEnvoyConfigMulti(c *C) {
 	c.Assert(resources.Listeners[0].Address.GetSocketAddress().GetPortValue(), Equals, uint32(10000))
 	c.Assert(resources.Listeners[0].FilterChains, HasLen, 1)
 	chain := resources.Listeners[0].FilterChains[0]
-	c.Assert(chain.Filters, HasLen, 2)
-	c.Assert(chain.Filters[0].Name, Equals, "cilium.network")
-	c.Assert(chain.Filters[1].Name, Equals, "envoy.filters.network.http_connection_manager")
-	message, err := chain.Filters[1].GetTypedConfig().UnmarshalNew()
+	c.Assert(chain.Filters, HasLen, 1)
+	c.Assert(chain.Filters[0].Name, Equals, "envoy.filters.network.http_connection_manager")
+	message, err := chain.Filters[0].GetTypedConfig().UnmarshalNew()
 	c.Assert(err, IsNil)
 	c.Assert(message, Not(IsNil))
 	hcm, ok := message.(*envoy_config_http.HttpConnectionManager)
@@ -457,9 +452,8 @@ func (s *JSONSuite) TestCiliumEnvoyConfigMulti(c *C) {
 	//
 	// Check that HTTP filters are parsed
 	//
-	c.Assert(hcm.HttpFilters, HasLen, 2)
-	c.Assert(hcm.HttpFilters[0].Name, Equals, "cilium.l7policy")
-	c.Assert(hcm.HttpFilters[1].Name, Equals, "envoy.filters.http.router")
+	c.Assert(hcm.HttpFilters, HasLen, 1)
+	c.Assert(hcm.HttpFilters[0].Name, Equals, "envoy.filters.http.router")
 
 	//
 	// Check route resource
