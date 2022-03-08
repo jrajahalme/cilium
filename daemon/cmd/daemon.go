@@ -39,7 +39,6 @@ import (
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/endpointmanager"
-	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	"github.com/cilium/cilium/pkg/fqdn"
 	"github.com/cilium/cilium/pkg/hubble/observer"
@@ -458,8 +457,6 @@ func NewDaemon(ctx context.Context, cancel context.CancelFunc, epMgr *endpointma
 	d.configModifyQueue = eventqueue.NewEventQueueBuffered("config-modify-queue", ConfigModifyQueueSize)
 	d.configModifyQueue.Run()
 
-	d.svc = service.NewService(&d)
-
 	d.rec, err = recorder.NewRecorder(d.ctx, &d)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error while initializing BPF pcap recorder: %w", err)
@@ -483,6 +480,22 @@ func NewDaemon(ctx context.Context, cancel context.CancelFunc, epMgr *endpointma
 	d.endpointManager = epMgr
 	d.endpointManager.InitMetrics()
 
+	// Start the proxy before we start K8s watcher or restore endpoints so that we can inject
+	// the daemon's proxy into the k8s watcher and each endpoint.
+	// Note: d.endpointManager needs to be set before this
+	bootstrapStats.proxyStart.Start()
+	// FIXME: Make the port range configurable.
+	if option.Config.EnableL7Proxy {
+		d.l7Proxy = proxy.StartProxySupport(10000, 20000, option.Config.RunDir,
+			&d, option.Config.AgentLabels, d.datapath, d.endpointManager)
+	} else {
+		log.Info("L7 proxies are disabled")
+	}
+	bootstrapStats.proxyStart.End(true)
+
+	// Start service support after proxy support so that we can inject 'd.l7Proxy`.
+	d.svc = service.NewService(&d, d.l7Proxy)
+
 	d.redirectPolicyManager = redirectpolicy.NewRedirectPolicyManager(d.svc)
 	if option.Config.BGPAnnounceLBIP || option.Config.BGPAnnouncePodCIDR {
 		d.bgpSpeaker, err = speaker.New(ctx, speaker.Opts{
@@ -498,18 +511,6 @@ func NewDaemon(ctx context.Context, cancel context.CancelFunc, epMgr *endpointma
 	if option.Config.EnableIPv4EgressGateway {
 		d.egressGatewayManager = egressgateway.NewEgressGatewayManager(&d)
 	}
-
-	// Start the proxy before we start K8s watcher or restore endpoints so that we can inject the
-	// daemon's proxy into the k8s watcher and each endpoint.
-	bootstrapStats.proxyStart.Start()
-	// FIXME: Make the port range configurable.
-	if option.Config.EnableL7Proxy {
-		d.l7Proxy = proxy.StartProxySupport(10000, 20000, option.Config.RunDir,
-			&d, option.Config.AgentLabels, d.datapath, d.endpointManager)
-	} else {
-		log.Info("L7 proxies are disabled")
-	}
-	bootstrapStats.proxyStart.End(true)
 
 	d.k8sWatcher = watchers.NewK8sWatcher(
 		d.endpointManager,
@@ -1078,18 +1079,6 @@ func (d *Daemon) Close() {
 		d.datapathRegenTrigger.Shutdown()
 	}
 	d.nodeDiscovery.Close()
-}
-
-func (d *Daemon) UpsertEnvoyResources(ctx context.Context, resources envoy.Resources, portAllocator envoy.PortAllocator) error {
-	return d.l7Proxy.UpsertEnvoyResources(ctx, resources, portAllocator)
-}
-
-func (d *Daemon) UpdateEnvoyResources(ctx context.Context, old, new envoy.Resources, portAllocator envoy.PortAllocator) error {
-	return d.l7Proxy.UpdateEnvoyResources(ctx, old, new, portAllocator)
-}
-
-func (d *Daemon) DeleteEnvoyResources(ctx context.Context, resources envoy.Resources, portAllocator envoy.PortAllocator) error {
-	return d.l7Proxy.DeleteEnvoyResources(ctx, resources, portAllocator)
 }
 
 // TriggerReloadWithoutCompile causes all BPF programs and maps to be reloaded,

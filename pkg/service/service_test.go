@@ -39,7 +39,7 @@ func (m *ManagerTestSuite) SetUpTest(c *C) {
 	serviceIDAlloc.resetLocalID()
 	backendIDAlloc.resetLocalID()
 
-	m.svc = NewService(nil)
+	m.svc = NewService(nil, nil)
 	m.svc.lbmap = mockmaps.NewLBMockMap()
 	m.lbmap = m.svc.lbmap.(*mockmaps.LBMockMap)
 
@@ -290,7 +290,7 @@ func (m *ManagerTestSuite) TestRestoreServices(c *C) {
 	option.Config.NodePortAlg = option.NodePortAlgMaglev
 	option.Config.DatapathMode = datapathOpt.DatapathModeLBOnly
 	lbmap := m.svc.lbmap.(*mockmaps.LBMockMap)
-	m.svc = NewService(nil)
+	m.svc = NewService(nil, nil)
 	m.svc.lbmap = lbmap
 
 	// Restore services from lbmap
@@ -361,7 +361,7 @@ func (m *ManagerTestSuite) TestSyncWithK8sFinished(c *C) {
 
 	// Restart service, but keep the lbmap to restore services from
 	lbmap := m.svc.lbmap.(*mockmaps.LBMockMap)
-	m.svc = NewService(nil)
+	m.svc = NewService(nil, nil)
 	m.svc.lbmap = lbmap
 	err = m.svc.RestoreServices()
 	c.Assert(err, IsNil)
@@ -838,7 +838,7 @@ func (m *ManagerTestSuite) TestRestoreServiceWithTerminatingBackends(c *C) {
 
 	// Simulate agent restart.
 	lbmap := m.svc.lbmap.(*mockmaps.LBMockMap)
-	m.svc = NewService(nil)
+	m.svc = NewService(nil, nil)
 	m.svc.lbmap = lbmap
 
 	// Restore services from lbmap

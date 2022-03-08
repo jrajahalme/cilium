@@ -63,9 +63,11 @@ type healthServer interface {
 // monitorNotify is used to send update notifications to the monitor
 type monitorNotify interface {
 	SendNotification(msg monitorAPI.AgentNotifyMessage) error
+}
+
+// envoyCache is used to sync Envoy resources to Envoy proxy
+type envoyCache interface {
 	UpsertEnvoyResources(context.Context, envoy.Resources, envoy.PortAllocator) error
-	UpdateEnvoyResources(ctx context.Context, old, new envoy.Resources, portAllocator envoy.PortAllocator) error
-	DeleteEnvoyResources(context.Context, envoy.Resources, envoy.PortAllocator) error
 }
 
 type svcInfo struct {
@@ -167,6 +169,7 @@ type Service struct {
 
 	healthServer  healthServer
 	monitorNotify monitorNotify
+	envoyCache    envoyCache
 
 	lbmap         LBMap
 	lastUpdatedTs atomic.Value
@@ -176,7 +179,7 @@ type Service struct {
 }
 
 // NewService creates a new instance of the service handler.
-func NewService(monitorNotify monitorNotify) *Service {
+func NewService(monitorNotify monitorNotify, envoyCache envoyCache) *Service {
 
 	var localHealthServer healthServer
 	if option.Config.EnableHealthCheckNodePort {
@@ -192,6 +195,7 @@ func NewService(monitorNotify monitorNotify) *Service {
 		backendRefCount: counter.StringCounter{},
 		backendByHash:   map[string]*lb.Backend{},
 		monitorNotify:   monitorNotify,
+		envoyCache:      envoyCache,
 		healthServer:    localHealthServer,
 		lbmap:           lbmap.New(maglev, maglevTableSize),
 		l7lbSvcs:        map[string]*L7LBInfo{},
@@ -480,8 +484,10 @@ func (s *Service) upsertEnvoyEndpoints(svc *svcInfo) error {
 	}
 	var resources envoy.Resources
 	resources.Endpoints = append(resources.Endpoints, endpoint)
-	if s.monitorNotify != nil {
-		return s.monitorNotify.UpsertEnvoyResources(context.TODO(), resources, nil)
+	if s.envoyCache != nil {
+		// Using context.TODO() is fine as we do not upsert listener resources here - the
+		// context ends up being used only if listener(s) are included in 'resources'.
+		return s.envoyCache.UpsertEnvoyResources(context.TODO(), resources, nil)
 	}
 	return nil
 }
