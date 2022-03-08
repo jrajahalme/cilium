@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cilium/cilium/pkg/option"
-
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cilium/cilium/pkg/option"
 )
 
 // +genclient
@@ -77,7 +77,13 @@ type CiliumEnvoyConfigSpec struct {
 	// +kubebuilder:validation:Optional
 	Ingress bool `json:"ingress,omitempty"`
 
-	// Envoy xDS resources
+	// Envoy xDS resources, a list of the following Envoy resource types:
+	// type.googleapis.com/envoy.config.listener.v3.Listener,
+	// type.googleapis.com/envoy.config.route.v3.RouteConfiguration,
+	// type.googleapis.com/envoy.config.cluster.v3.Cluster,
+	// type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment, and
+	// type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret.
+	//
 	// +kubebuilder:validation:Required
 	Resources []XDSResource `json:"resources,omitempty"`
 }

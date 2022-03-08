@@ -70,7 +70,10 @@ spec:
                   and must be set properly."
                 type: boolean
               resources:
-                description: Envoy xDS resources
+                description: 'Envoy xDS resources, a list of the following Envoy resource
+                  types: type.googleapis.com/envoy.config.listener.v3.Listener, type.googleapis.com/envoy.config.route.v3.RouteConfiguration,
+                  type.googleapis.com/envoy.config.cluster.v3.Cluster, type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment,
+                  and type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret.'
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
