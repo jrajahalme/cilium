@@ -88,6 +88,10 @@ type svcInfo struct {
 	restoredFromDatapath bool
 }
 
+func (svc *svcInfo) isL7LBService() bool {
+	return svc.l7LBProxyPort != 0
+}
+
 func (svc *svcInfo) deepCopyToLBSVC() *lb.SVC {
 	backends := make([]lb.Backend, len(svc.backends))
 	for i, backend := range svc.backends {
@@ -949,7 +953,10 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, onlyLocalBackends bool,
 	)
 
 	// Update sessionAffinity
-	if option.Config.EnableSessionAffinity && svc.l7LBProxyPort == 0 {
+	//
+	// If L7 LB is configured for this service then BPF level session affinity is not used so
+	// that the L7 proxy port may be passed in a shared union in the service entry.
+	if option.Config.EnableSessionAffinity && !svc.isL7LBService() {
 		if prevSessionAffinity && !svc.sessionAffinity {
 			// Remove backends from the affinity match because the svc's sessionAffinity
 			// has been disabled
@@ -1041,7 +1048,8 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, onlyLocalBackends bool,
 		return err
 	}
 
-	if option.Config.EnableSessionAffinity && svc.l7LBProxyPort == 0 {
+	// If L7 LB is configured for this service then BPF level session affinity is not used.
+	if option.Config.EnableSessionAffinity && !svc.isL7LBService() {
 		s.addBackendsToAffinityMatchMap(svc.frontend.ID, toAddAffinity)
 	}
 
