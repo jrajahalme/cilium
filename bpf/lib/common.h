@@ -472,6 +472,9 @@ enum metric_dir {
  * packets security identity. The lower/upper halves are swapped to recover
  * the identity.
  *
+ * In case of MARK_MAGIC_PROXY_EGRESS_EPID the upper 16 bits carry the Endpoint
+ * ID instead of the security identity and the lower 8 bits will be zeroes.
+ *
  * The 4 bits at 0X0F00 provide
  *  - the magic marker values which indicate whether the packet is coming from
  *    an ingress or egress proxy, a local process and its current encryption
