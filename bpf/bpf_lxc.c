@@ -1894,13 +1894,11 @@ int handle_policy_egress(struct __ctx_buff *ctx)
 		goto out;
 	}
 
-	ifindex = ctx_load_meta(ctx, CB_IFINDEX);
-	ctx_store_meta(ctx, CB_IFINDEX, 0);
 	ctx_store_meta(ctx, CB_FROM_HOST, FROM_HOST_L7_LB);
 
 	edt_set_aggregate(ctx, 0); /* do not count this traffic again */
 	send_trace_notify(ctx, TRACE_FROM_PROXY, SECLABEL, 0, 0,
-			  ifindex, 0, TRACE_PAYLOAD_LEN);
+			  0 /*ifindex*/, 0, TRACE_PAYLOAD_LEN);
 
 	switch (proto) {
 #ifdef ENABLE_IPV6
