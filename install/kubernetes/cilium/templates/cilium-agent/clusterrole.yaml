@@ -103,8 +103,6 @@ rules:
   - ciliumegressnatpolicies
   - ciliumendpointslices
   - ciliumenvoyconfigs
-  - ciliumenvoyconfigs/status
-  - ciliumenvoyconfigs/finalizers
   verbs:
   - '*'
 {{- end }}
