@@ -4,12 +4,14 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"iter"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/container/versioned"
+	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
@@ -186,22 +188,37 @@ func (p *EndpointPolicy) Ready() (err error) {
 	return err
 }
 
-// GetPolicyMap gets the policy map state as the interface
-// MapState
-func (p *EndpointPolicy) GetPolicyMap() MapState {
-	return p.policyMapState
+func (p *EndpointPolicy) Len() int {
+	return p.policyMapState.Len()
 }
 
-// SetPolicyMap sets the policy map state as the interface
-// MapState. If the main argument is nil, then this method
-// will initialize a new MapState object for the caller.
-func (p *EndpointPolicy) SetPolicyMap(ms MapState) {
-	m, ok := ms.(*mapState)
-	if !ok || m == nil {
-		p.policyMapState = newMapState()
-		return
+func (p *EndpointPolicy) Get(key Key) (MapStateEntry, bool) {
+	return p.policyMapState.Get(key)
+}
+
+var errMissingKey = errors.New("Key not found")
+
+// GetRuleLabels returns the list of labels of the rules that contributed
+// to the entry at this key.
+// The returned LabelArrayList is shallow-copied and therefore must not be mutated.
+func (p *EndpointPolicy) GetRuleLabels(k Key) (labels.LabelArrayList, error) {
+	entry, ok := p.policyMapState.get(k)
+	if !ok {
+		return nil, errMissingKey
 	}
-	p.policyMapState = m
+	return entry.GetRuleLabels(), nil
+}
+
+func (p *EndpointPolicy) ForEach(yield func(Key, MapStateEntry) (cont bool)) (complete bool) {
+	return p.policyMapState.ForEach(yield)
+}
+
+func (p *EndpointPolicy) Equals(other MapStateMap) bool {
+	return p.policyMapState.Equals(other)
+}
+
+func (p *EndpointPolicy) Diff(expected MapStateMap) string {
+	return p.policyMapState.Diff(expected)
 }
 
 // Detach removes EndpointPolicy references from selectorPolicy
@@ -218,27 +235,6 @@ func (p *EndpointPolicy) Detach() {
 	// This must be done after the removeUser() call above, so that we do not get a new version
 	// handles any more!
 	p.policyMapChanges.detach()
-}
-
-// NewMapStateWithInsert returns a new MapState and an insert function that can be used to populate
-// it. We keep general insert functions private so that the caller can only insert to this specific
-// map.
-func NewMapStateWithInsert() (MapState, func(k Key, e MapStateEntry)) {
-	currentMap := newMapState()
-
-	return currentMap, func(k Key, e MapStateEntry) {
-		currentMap.insert(k, e)
-	}
-}
-
-func (p *EndpointPolicy) InsertMapState(key Key, entry MapStateEntry) {
-	// SelectorCache used as Identities interface which only has GetPrefix() that needs no lock
-	p.policyMapState.insert(key, entry)
-}
-
-func (p *EndpointPolicy) DeleteMapState(key Key) {
-	// SelectorCache used as Identities interface which only has GetPrefix() that needs no lock
-	p.policyMapState.delete(key)
 }
 
 func (p *EndpointPolicy) RevertChanges(changes ChangeState) {
