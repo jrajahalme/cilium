@@ -78,14 +78,7 @@ var (
 		labels.NewLabel(LabelKeyPolicyDerivedFrom, LabelAllowAnyEgress, labels.LabelSourceReserved)}}
 )
 
-// mapState is a state of a policy map.
-type mapState struct {
-	allows mapStateMap
-	denies mapStateMap
-}
-
-// mapStateMap is a convience type representing the actual structure mapping
-// policymap keys to policymap entries.
+// mapState is an indexed container for policymap keys and entries.
 //
 // The `bitlpm.Trie` indexes the TrafficDirection, Protocol, and Port of
 // a policy Key but does **not** index the identity. Instead identities
@@ -101,7 +94,7 @@ type mapState struct {
 // that associates each identity with a mapStateEntry. This strategy
 // greatly enhances the usefuleness of the Trie and improves lookup,
 // deletion, and insertion times.
-type mapStateMap struct {
+type mapState struct {
 	// entries is the map containing the MapStateEntries
 	entries map[Key]mapStateEntry
 	// trie is a Trie that indexes policy Keys without their identity
@@ -111,16 +104,21 @@ type mapStateMap struct {
 
 type IDSet map[identity.NumericIdentity]struct{}
 
-func (msm *mapStateMap) Empty() bool {
+// Valid returns true if the entries map has been initialized
+func (msm *mapState) Valid() bool {
+	return msm.entries != nil
+}
+
+func (msm *mapState) Empty() bool {
 	return len(msm.entries) == 0
 }
 
-func (msm *mapStateMap) Lookup(k Key) (mapStateEntry, bool) {
+func (msm *mapState) Lookup(k Key) (mapStateEntry, bool) {
 	v, ok := msm.entries[k]
 	return v, ok
 }
 
-func (msm *mapStateMap) upsert(k Key, e mapStateEntry) {
+func (msm *mapState) upsert(k Key, e mapStateEntry) {
 	_, exists := msm.entries[k]
 
 	// upsert entry
@@ -141,7 +139,7 @@ func (msm *mapStateMap) upsert(k Key, e mapStateEntry) {
 	}
 }
 
-func (msm *mapStateMap) delete(k Key) {
+func (msm *mapState) delete(k Key) {
 	_, exists := msm.entries[k]
 	if exists {
 		delete(msm.entries, k)
@@ -157,7 +155,7 @@ func (msm *mapStateMap) delete(k Key) {
 	}
 }
 
-func (msm *mapStateMap) ForEach(f func(Key, MapStateEntry) bool) bool {
+func (msm *mapState) ForEach(f func(Key, MapStateEntry) bool) bool {
 	for k, e := range msm.entries {
 		if !f(k, e.MapStateEntry) {
 			return false
@@ -166,7 +164,7 @@ func (msm *mapStateMap) ForEach(f func(Key, MapStateEntry) bool) bool {
 	return true
 }
 
-func (msm *mapStateMap) forEach(f func(Key, mapStateEntry) bool) bool {
+func (msm *mapState) forEach(f func(Key, mapStateEntry) bool) bool {
 	for k, e := range msm.entries {
 		if !f(k, e) {
 			return false
@@ -175,7 +173,7 @@ func (msm *mapStateMap) forEach(f func(Key, mapStateEntry) bool) bool {
 	return true
 }
 
-func (msm *mapStateMap) forKey(k Key, f func(Key, mapStateEntry) bool) bool {
+func (msm *mapState) forKey(k Key, f func(Key, mapStateEntry) bool) bool {
 	e, ok := msm.entries[k]
 	if ok {
 		return f(k, e)
@@ -188,7 +186,7 @@ func (msm *mapStateMap) forKey(k Key, f func(Key, mapStateEntry) bool) bool {
 }
 
 // forDifferentKeys calls 'f' for each Key 'k' with identities in 'idSet', if different from 'key'.
-func (msm *mapStateMap) forDifferentKeys(key, k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
+func (msm *mapState) forDifferentKeys(key, k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
 	for id := range idSet {
 		k.Identity = id
 		if key != k && !msm.forKey(k, f) {
@@ -199,7 +197,7 @@ func (msm *mapStateMap) forDifferentKeys(key, k Key, idSet IDSet, f func(Key, ma
 }
 
 // forIDs calls 'f' for each ID in 'idSet' with port/proto from 'k'.
-func (msm *mapStateMap) forIDs(k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
+func (msm *mapState) forIDs(k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
 	for id := range idSet {
 		k.Identity = id
 		if !msm.forKey(k, f) {
@@ -210,7 +208,7 @@ func (msm *mapStateMap) forIDs(k Key, idSet IDSet, f func(Key, mapStateEntry) bo
 }
 
 // forID calls 'f' for 'k' if 'k.Identity' exists in 'idSet'.
-func (msm *mapStateMap) forID(k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
+func (msm *mapState) forID(k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
 	if _, exists := idSet[k.Identity]; exists {
 		if !msm.forKey(k, f) {
 			return false
@@ -221,7 +219,7 @@ func (msm *mapStateMap) forID(k Key, idSet IDSet, f func(Key, mapStateEntry) boo
 
 // BroaderOrEqualKeys iterates over broader or equal (broader or equal port/proto and the same
 // or wildcard ID) in the trie.
-func (msm *mapStateMap) BroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
+func (msm *mapState) BroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := msm.trie.AncestorIterator(key.PrefixLength(), key)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -242,7 +240,8 @@ func (msm *mapStateMap) BroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry
 }
 
 // NarrowerKeys iterates over narrower keys in the trie.
-func (msm *mapStateMap) NarrowerKeys(key Key) iter.Seq2[Key, mapStateEntry] {
+// TODO: remove, not used
+func (msm *mapState) NarrowerKeys(key Key) iter.Seq2[Key, mapStateEntry] {
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := msm.trie.DescendantIterator(key.PrefixLength(), key)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -267,7 +266,7 @@ func (msm *mapStateMap) NarrowerKeys(key Key) iter.Seq2[Key, mapStateEntry] {
 // NarrowerOrEqualKeys iterates over narrower or equal keys in the trie.
 // Iterated keys can be safely deleted during iteration due to DescendantIterator holding enough
 // state that allows iteration to be continued even if the current trie node is removed.
-func (msm *mapStateMap) NarrowerOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
+func (msm *mapState) NarrowerOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := msm.trie.DescendantIterator(key.PrefixLength(), key)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -290,7 +289,7 @@ func (msm *mapStateMap) NarrowerOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntr
 
 // CoveringKeysWithSameID iterates over broader port/proto entries in the trie in LPM order,
 // with most specific match with the same ID as in 'key' being returned first.
-func (msm *mapStateMap) CoveringKeysWithSameID(key Key) iter.Seq2[Key, mapStateEntry] {
+func (msm *mapState) CoveringKeysWithSameID(key Key) iter.Seq2[Key, mapStateEntry] {
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := msm.trie.AncestorLongestPrefixFirstIterator(key.PrefixLength(), key)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -306,7 +305,7 @@ func (msm *mapStateMap) CoveringKeysWithSameID(key Key) iter.Seq2[Key, mapStateE
 
 // SubsetKeysWithSameID iterates over narrower or equal port/proto entries in the trie in an LPM
 // order (least specific match first).
-func (msm *mapStateMap) SubsetKeysWithSameID(key Key) iter.Seq2[Key, mapStateEntry] {
+func (msm *mapState) SubsetKeysWithSameID(key Key) iter.Seq2[Key, mapStateEntry] {
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := msm.trie.DescendantShortestPrefixFirstIterator(key.PrefixLength(), key)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -320,7 +319,7 @@ func (msm *mapStateMap) SubsetKeysWithSameID(key Key) iter.Seq2[Key, mapStateEnt
 	}
 }
 
-func (msm *mapStateMap) Len() int {
+func (msm *mapState) Len() int {
 	return len(msm.entries)
 }
 
@@ -411,17 +410,10 @@ func (e *mapStateEntry) GetRuleLabels() labels.LabelArrayList {
 	return e.derivedFromRules
 }
 
-func newMapStateMap() mapStateMap {
-	return mapStateMap{
+func newMapState() mapState {
+	return mapState{
 		entries: make(map[Key]mapStateEntry),
 		trie:    bitlpm.NewTrie[policyTypes.LPMKey, IDSet](policyTypes.MapStatePrefixLen),
-	}
-}
-
-func newMapState() *mapState {
-	return &mapState{
-		allows: newMapStateMap(),
-		denies: newMapStateMap(),
 	}
 }
 
@@ -442,11 +434,7 @@ func (ms *mapState) get(k Key) (mapStateEntry, bool) {
 			logfields.PolicyKey:  k,
 		}).Errorf("mapState.Get: invalid port prefix length for wildcard port")
 	}
-	v, ok := ms.denies.Lookup(k)
-	if ok {
-		return v, ok
-	}
-	return ms.allows.Lookup(k)
+	return ms.Lookup(k)
 }
 
 // insert the Key and MapStateEntry into the MapState
@@ -457,57 +445,13 @@ func (ms *mapState) insert(k Key, v mapStateEntry) {
 			logfields.PolicyKey:  k,
 		}).Errorf("mapState.insert: invalid port prefix length for wildcard port")
 	}
-	if v.IsDeny {
-		ms.allows.delete(k)
-		ms.denies.upsert(k, v)
-	} else {
-		ms.denies.delete(k)
-		ms.allows.upsert(k, v)
-	}
+	ms.upsert(k, v)
 }
 
 // updateExisting re-inserts an existing entry to its map, to be used to persist changes in the
-// entry.
-// NOTE: Only to be used when Key and v.IsDeny has not been changed!
+// entry. Indices are not updated.
 func (ms *mapState) updateExisting(k Key, v mapStateEntry) {
-	if v.IsDeny {
-		ms.denies.entries[k] = v
-	} else {
-		ms.allows.entries[k] = v
-	}
-}
-
-// deleteExisting removes the Key an related MapStateEntry.
-func (ms *mapState) deleteExisting(k Key, v mapStateEntry) {
-	if v.IsDeny {
-		ms.denies.delete(k)
-	} else {
-		ms.allows.delete(k)
-	}
-}
-
-// delete removes the Key and related MapStateEntry.
-func (ms *mapState) delete(k Key) {
-	ms.allows.delete(k)
-	ms.denies.delete(k)
-}
-
-// ForEach iterates over every Key MapStateEntry and stops when the function
-// argument returns false. It returns false iff the iteration was cut short.
-func (ms *mapState) ForEach(f func(Key, MapStateEntry) (cont bool)) (complete bool) {
-	return ms.allows.ForEach(f) && ms.denies.ForEach(f)
-}
-
-// forEach iterates over every Key MapStateEntry and stops when the function
-// argument returns false. It returns false iff the iteration was cut short.
-// Used for testing.
-func (ms *mapState) forEach(f func(Key, mapStateEntry) (cont bool)) (complete bool) {
-	return ms.allows.forEach(f) && ms.denies.forEach(f)
-}
-
-// Len returns the length of the map
-func (ms *mapState) Len() int {
-	return ms.allows.Len() + ms.denies.Len()
+	ms.entries[k] = v
 }
 
 // equalsWithLabels determines if this mapState is equal to the
@@ -536,9 +480,9 @@ func (msA *mapState) Equals(msB MapStateMap) bool {
 	})
 }
 
-// deepEquals determines if this MapState is equal to the argument MapState.
+// Equal determines if this mapState is equal to the argument mapState.
 // Only used for testing.
-func (msA *mapState) deepEquals(msB *mapState) bool {
+func (msA *mapState) Equal(msB *mapState) bool {
 	if msA.Len() != msB.Len() {
 		return false
 	}
@@ -799,8 +743,7 @@ func (ms *mapState) deleteKeyWithChanges(key Key, owner MapStateOwner, changes C
 			}
 		}
 
-		// delete entry from the map it exists in
-		ms.deleteExisting(key, entry)
+		ms.delete(key)
 	}
 }
 
@@ -808,8 +751,7 @@ func (ms *mapState) deleteKeyWithChanges(key Key, owner MapStateOwner, changes C
 // denyPreferredInsertWithChanges().
 func (ms *mapState) revertChanges(changes ChangeState) {
 	for k := range changes.Adds {
-		ms.allows.delete(k)
-		ms.denies.delete(k)
+		ms.delete(k)
 	}
 	// 'old' contains all the original values of both modified and deleted entries
 	for k, v := range changes.old {
@@ -862,23 +804,20 @@ func (ms *mapState) insertWithChanges(key Key, entry mapStateEntry, features pol
 // Incremental changes performed are recorded in 'changes'.
 func (ms *mapState) denyPreferredInsertWithChanges(newKey Key, newEntry mapStateEntry, features policyFeatures, changes ChangeState) {
 	// Bail if covered by a deny key
-	if !ms.denies.Empty() {
-		for k := range ms.denies.BroaderOrEqualKeys(newKey) {
-			// Identical deny key needs to be added to merge their entries.
-			if k != newKey || !newEntry.IsDeny {
-				return
-			}
+	for k, v := range ms.BroaderOrEqualKeys(newKey) {
+		// Identical deny key needs to be added to merge their entries.
+		if v.IsDeny && !(newEntry.IsDeny && k == newKey) {
+			return
 		}
 	}
 
 	if newEntry.IsDeny {
-		// Delete covered allow entries.
-		for k := range ms.allows.NarrowerOrEqualKeys(newKey) {
-			ms.deleteKeyWithChanges(k, nil, changes)
-		}
-		// Delete covered deny entries, except for identical keys that need to be merged.
-		for k := range ms.denies.NarrowerKeys(newKey) {
-			ms.deleteKeyWithChanges(k, nil, changes)
+		// Delete covered entries
+		for k, v := range ms.NarrowerOrEqualKeys(newKey) {
+			// Except for identical deny keys that need to be merged.
+			if !(v.IsDeny && k == newKey) {
+				ms.deleteKeyWithChanges(k, nil, changes)
+			}
 		}
 	} else {
 		// newEntry is an allow entry.
@@ -902,7 +841,7 @@ func (ms *mapState) overrideAuthType(newEntry mapStateEntry, k Key, v mapStateEn
 
 	// Auth type can be changed in-place, trie is not affected
 	v.AuthType = newEntry.AuthType
-	ms.allows.entries[k] = v
+	ms.entries[k] = v
 }
 
 // authPreferredInsert applies AuthType of a more generic entry to more specific entries, if not
@@ -917,7 +856,10 @@ func (ms *mapState) authPreferredInsert(newKey Key, newEntry mapStateEntry, chan
 
 		// Fill in the AuthType from the most specific covering key with the same ID and an
 		// explicit auth type
-		for _, v := range ms.allows.CoveringKeysWithSameID(newKey) {
+		for _, v := range ms.CoveringKeysWithSameID(newKey) {
+			if v.IsDeny {
+				panic("covering deny key should not exist")
+			}
 			if v.HasAuthType == ExplicitAuthType {
 				// AuthType from the most specific covering key is applied to
 				// 'newEntry'
@@ -929,10 +871,11 @@ func (ms *mapState) authPreferredInsert(newKey Key, newEntry mapStateEntry, chan
 		// Check if the new key is the most specific covering key of any other key
 		// with the same ID and default auth type, and propagate the auth type from the new
 		// entry to such entries.
-		for k, v := range ms.allows.SubsetKeysWithSameID(newKey) {
-			if v.HasAuthType == ExplicitAuthType {
-				// Stop if a subset entry has an explicit auth type, as that is the
-				// more specific covering key for all remaining subset keys
+		for k, v := range ms.SubsetKeysWithSameID(newKey) {
+			if v.IsDeny || v.HasAuthType == ExplicitAuthType {
+				// Stop if a subset entry is deny or has an explicit auth type, as
+				// that is the more specific covering key for all remaining subset
+				// keys
 				break
 			}
 			ms.overrideAuthType(newEntry, k, v, changes)
@@ -988,10 +931,10 @@ func (ms *mapState) determineAllowLocalhostIngress() {
 // Note that this is used when policy is not enforced, so authentication is explicitly not required.
 func (ms *mapState) allowAllIdentities(ingress, egress bool) {
 	if ingress {
-		ms.allows.upsert(allKey[trafficdirection.Ingress], newMapStateEntry(nil, LabelsAllowAnyIngress, 0, "", 0, false, ExplicitAuthType, AuthTypeDisabled))
+		ms.upsert(allKey[trafficdirection.Ingress], newMapStateEntry(nil, LabelsAllowAnyIngress, 0, "", 0, false, ExplicitAuthType, AuthTypeDisabled))
 	}
 	if egress {
-		ms.allows.upsert(allKey[trafficdirection.Egress], newMapStateEntry(nil, LabelsAllowAnyEgress, 0, "", 0, false, ExplicitAuthType, AuthTypeDisabled))
+		ms.upsert(allKey[trafficdirection.Egress], newMapStateEntry(nil, LabelsAllowAnyEgress, 0, "", 0, false, ExplicitAuthType, AuthTypeDisabled))
 	}
 }
 
