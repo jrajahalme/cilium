@@ -58,6 +58,10 @@ func RunE(hooks api.Hooks) func(cmd *cobra.Command, args []string) error {
 		params.ImpersonateAs = impersonateAs
 		params.ImpersonateGroups = impersonateGroups
 
+		// Remove trailing dot from external-target paramater to make it compatible for
+		// use as an SNI
+		params.ExternalTarget, _ = strings.CutSuffix(params.ExternalTarget, ".")
+
 		for _, test := range tests {
 			if strings.HasPrefix(test, "!") {
 				rgx, err := regexp.Compile(strings.TrimPrefix(test, "!"))
@@ -128,7 +132,7 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().BoolVarP(&params.Verbose, "verbose", "v", false, "Show informational messages and don't buffer any lines")
 	cmd.Flags().BoolVarP(&params.Timestamp, "timestamp", "t", false, "Show timestamp in messages")
 	cmd.Flags().BoolVarP(&params.PauseOnFail, "pause-on-fail", "p", false, "Pause execution on test failure")
-	cmd.Flags().StringVar(&params.ExternalTarget, "external-target", "one.one.one.one.", "Domain name to use as external target in connectivity tests")
+	cmd.Flags().StringVar(&params.ExternalTarget, "external-target", "one.one.one.one", "Domain name to use as external target in connectivity tests")
 	cmd.Flags().StringVar(&params.ExternalTargetCANamespace, "external-target-ca-namespace", "", "Namespace of the CA secret for the external target. Used by client-egress-l7-tls test cases.")
 	cmd.Flags().StringVar(&params.ExternalTargetCAName, "external-target-ca-name", "cabundle", "Name of the CA secret for the external target. Used by client-egress-l7-tls test cases.")
 	cmd.Flags().StringVar(&params.ExternalCIDR, "external-cidr", "1.0.0.0/8", "CIDR to use as external target in connectivity tests")
