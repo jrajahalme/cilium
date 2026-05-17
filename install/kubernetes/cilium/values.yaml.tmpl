@@ -2734,8 +2734,12 @@ dashboards:
   annotations: {}
 # Configure Cilium Envoy options.
 envoy:
+  # -- xDS server implementation for Envoy proxy configuration. Supported
+  # values are "" for the existing per-resource-type xDS server and "ads" for
+  # the ADS (Aggregated Discovery Service) xDS server.
+  xdsMode: ""
   # @schema
-  # type: [null, boolean]
+  # type: [null, string]
   # @schema
   # -- Enable Envoy Proxy in standalone DaemonSet.
   # This field is enabled by default for new installation.

@@ -2312,6 +2312,20 @@
     },
     "envoy": {
       "properties": {
+        "xdsMode": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "enum": [
+                "",
+                "ads"
+              ],
+              "type": "string"
+            }
+          ]
+        },
         "affinity": {
           "properties": {
             "nodeAffinity": {
