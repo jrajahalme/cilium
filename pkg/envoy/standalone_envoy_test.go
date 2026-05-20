@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -249,12 +250,13 @@ func TestEnvoyAds(t *testing.T) {
 		maxConnections:                 10,
 		maxRequests:                    100,
 		maxConcurrentRetries:           10,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
 
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	t.Log("adding metrics listener")
 	xdsServer.AddMetricsListener(ctx, 9964, s.waitGroup)
@@ -309,8 +311,7 @@ func TestEnvoyAds(t *testing.T) {
 	s.waitGroup = completion.NewWaitGroup(ctx)
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
+	stopEnvoy()
 
 	time.Sleep(2 * time.Second) // Wait for Envoy to really terminate.
 
@@ -379,12 +380,13 @@ func TestEnvoyAdsResourcesHandling(t *testing.T) {
 		maxConnections:                 10,
 		maxRequests:                    100,
 		maxConcurrentRetries:           10,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
 
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	t.Log("adding admin listener")
 	xdsServer.AddAdminListener(ctx, 19001, s.waitGroup)
@@ -423,10 +425,7 @@ func TestEnvoyAdsResourcesHandling(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
-
-	time.Sleep(2 * time.Second) // Wait for Envoy to really terminate.
+	stopEnvoy()
 }
 
 func TestEnvoyAdsNetworkPoliciesHandling(t *testing.T) {
@@ -486,12 +485,13 @@ func TestEnvoyAdsNetworkPoliciesHandling(t *testing.T) {
 		maxConnections:                 10,
 		maxRequests:                    100,
 		maxConcurrentRetries:           10,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
 
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	// Step 1: Upsert base resources (includes network policies for endpoints 40 and 30)
 	t.Log("upserting base ADS resources with network policies")
@@ -552,10 +552,7 @@ func TestEnvoyAdsNetworkPoliciesHandling(t *testing.T) {
 	t.Log("completed removing all network policies")
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
-
-	time.Sleep(2 * time.Second) // Wait for Envoy to really terminate.
+	stopEnvoy()
 }
 
 // standaloneTestEndpointInfoSource is a mock for endpoint.EndpointInfoSource used in standalone envoy tests.
@@ -588,6 +585,17 @@ func (m *standaloneTestEndpointInfoSource) GetNamedPort(ingress bool, name strin
 
 func (m *standaloneTestEndpointInfoSource) GetIngressNamedPort(name string, proto u8proto.U8proto) uint16 {
 	return 0
+}
+
+func cleanupStandaloneEnvoy(t *testing.T, envoyProxy *StandaloneEnvoy) func() {
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			require.NoError(t, envoyProxy.Stop())
+		})
+	}
+	t.Cleanup(stop)
+	return stop
 }
 
 func TestEnvoy(t *testing.T) {
@@ -647,12 +655,13 @@ func TestEnvoy(t *testing.T) {
 		maxConcurrentRetries:           128,
 		maxConnections:                 1024,
 		maxRequests:                    1024,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
 
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	t.Log("adding metrics listener")
 	xdsServer.AddMetricsListener(context.Background(), 9964, s.waitGroup)
@@ -703,8 +712,7 @@ func TestEnvoy(t *testing.T) {
 	s.waitGroup = completion.NewWaitGroup(ctx)
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
+	stopEnvoy()
 
 	time.Sleep(2 * time.Second) // Wait for Envoy to really terminate.
 
@@ -772,12 +780,13 @@ func TestEnvoyNACK(t *testing.T) {
 		maxConcurrentRetries:           128,
 		maxConnections:                 1024,
 		maxRequests:                    1024,
+		maxPendingRequests:             1024,
 	})
 	require.NotNil(t, envoyProxy)
 	require.NoError(t, err)
 	t.Log("started Envoy")
 
-	defer envoyProxy.admin.quit()
+	cleanupStandaloneEnvoy(t, envoyProxy)
 
 	rName := "listener:22"
 
@@ -793,7 +802,7 @@ func TestEnvoyNACK(t *testing.T) {
 	err = s.waitForProxyCompletion()
 	require.Error(t, err)
 	require.True(t, cbCalled)
-	require.Equal(t, err, cbErr)
+	require.ErrorIs(t, err, cbErr)
 	require.EqualValues(t, &xds.ProxyError{Err: xds.ErrNackReceived, Detail: "Error adding/updating listener(s) listener:22: cannot bind '127.0.0.1:22': Address already in use\n"}, err)
 
 	s.waitGroup = completion.NewWaitGroup(ctx)
@@ -859,11 +868,12 @@ func TestEnvoyAdsNACKRevert(t *testing.T) {
 		maxConnections:                 10,
 		maxRequests:                    100,
 		maxConcurrentRetries:           10,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	// Step 1: Add a valid listener so Envoy has a known-good baseline.
 	t.Log("adding valid listener on port 8081")
@@ -924,9 +934,7 @@ func TestEnvoyAdsNACKRevert(t *testing.T) {
 	t.Log("successfully added listener after NACK revert — xDS server is healthy")
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
-	time.Sleep(2 * time.Second)
+	stopEnvoy()
 }
 
 func TestEnvoyAdsMultipleVersionsSentBeforeAckReceived(t *testing.T) {
@@ -981,11 +989,12 @@ func TestEnvoyAdsMultipleVersionsSentBeforeAckReceived(t *testing.T) {
 		maxConnections:                 10,
 		maxRequests:                    100,
 		maxConcurrentRetries:           10,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	// Step 1: Add a first listener so Envoy connects and we have a baseline.
 	s.waitGroup = completion.NewWaitGroup(ctx)
@@ -1022,9 +1031,7 @@ func TestEnvoyAdsMultipleVersionsSentBeforeAckReceived(t *testing.T) {
 	t.Log("all rapid listeners present and all completions resolved")
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
-	time.Sleep(2 * time.Second)
+	stopEnvoy()
 }
 
 func TestEnvoyAdsMultipleVersionsSentBeforeNackReceived(t *testing.T) {
@@ -1079,11 +1086,12 @@ func TestEnvoyAdsMultipleVersionsSentBeforeNackReceived(t *testing.T) {
 		maxConnections:                 10,
 		maxRequests:                    100,
 		maxConcurrentRetries:           10,
+		maxPendingRequests:             1024,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, envoyProxy)
 	t.Log("started Envoy")
-	defer envoyProxy.admin.quit()
+	stopEnvoy := cleanupStandaloneEnvoy(t, envoyProxy)
 
 	// Step 1: Add a valid baseline listener.
 	s.waitGroup = completion.NewWaitGroup(ctx)
@@ -1125,9 +1133,7 @@ func TestEnvoyAdsMultipleVersionsSentBeforeNackReceived(t *testing.T) {
 	t.Log("verified snapshot was reverted after NACK, no completions stuck")
 
 	t.Log("stopping Envoy")
-	err = envoyProxy.Stop()
-	require.NoError(t, err)
-	time.Sleep(2 * time.Second)
+	stopEnvoy()
 }
 
 type proxyAccessLoggerMock struct{}
