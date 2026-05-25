@@ -199,7 +199,14 @@ func (c *CacheImpl) GenerateSnapshot(resources *xds.Resources, logger *slog.Logg
 	networkPolicies := make(map[string]cache_types.Resource, len(resources.NetworkPolicies))
 	secrets := make([]cache_types.Resource, 0, len(resources.Secrets))
 
-	for _, r := range resources.Endpoints {
+	for name, r := range resources.Endpoints {
+		// Skip wildcard :* endpoints that have no matching cluster,
+		// as they cause snapshot inconsistency (EDS count > CDS references).
+		// These are generated for backward compatibility with the old per-type
+		// xDS caches but are not needed in the ADS snapshot.
+		if _, hasCluster := resources.Clusters[name]; !hasCluster && len(name) > 2 && name[len(name)-2:] == ":*" {
+			continue
+		}
 		endpoints = append(endpoints, r)
 	}
 	for _, r := range resources.Clusters {
@@ -261,39 +268,48 @@ func (c CacheImpl) SetSnapshot(ctx context.Context, nodeID string, newSnapshot c
 
 func (c CacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot WrappedSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error {
 	addCompletion := func(wg *completion.WaitGroup, cb func(err error)) *completion.Completion {
-		if cb != nil {
-			return wg.AddCompletionWithCallback(nil, cb)
-		}
-		return wg.AddCompletion(nil)
+		return wg.AddCompletionWithCallback(nil, cb)
 	}
 
-	var comp *completion.Completion
+	var completions []*completion.Completion
 	if wg != nil && len(updatedTypeURLS) > 0 {
 		for typeURL := range updatedTypeURLS {
-			// Custom Cilium resource typed will be processed below once resource version has been computed by the linear cache.
+			// Custom Cilium resource types are processed below once resource
+			// versions have been computed by their linear caches.
 			if typeURL != NetworkPolicyTypeURL && typeURL != NetworkPolicyHostsTypeUrl {
-				comp = addCompletion(wg, callback)
+				comp := addCompletion(wg, callback)
+				completions = append(completions, comp)
 				c.completionCbs.AddTypeVersionCompletion(comp, newSnapshot.GetVersion(typeURL), typeURL, nodeID, revertFunc)
 			}
 		}
 	}
 	err := c.snapshotCache.SetSnapshot(ctx, nodeID, newSnapshot.Snapshot)
 
-	if err != nil && comp != nil {
-		c.completionCbs.RemoveTypeVersionCompletion(comp)
-	}
-
-	if len(newSnapshot.NetworkPolicies) > 0 {
-		err = c.npdsCache.UpdateResources(newSnapshot.NetworkPolicies, nil)
-		if wg != nil {
-			comp = addCompletion(wg, callback)
-			// todo (nezdolik) Currenltly is not possible to get resource version from linear cache, instead version will be updated in OnStreamResponse callback.
-			// https://github.com/envoyproxy/go-control-plane/pull/1467
-			c.completionCbs.AddTypeVersionCompletion(comp, "", NetworkPolicyTypeURL, nodeID, revertFunc)
+	if err != nil {
+		for _, comp := range completions {
+			c.completionCbs.RemoveTypeVersionCompletion(comp)
 		}
+		return err
 	}
 
-	return err
+	if _, updated := updatedTypeURLS[NetworkPolicyTypeURL]; updated {
+		if wg != nil {
+			comp := addCompletion(wg, callback)
+			if len(newSnapshot.NetworkPolicies) > 0 {
+				// todo (nezdolik) Currently is not possible to get resource version from linear cache, instead version will be updated in OnStreamResponse callback.
+				// https://github.com/envoyproxy/go-control-plane/pull/1467
+				c.completionCbs.AddTypeVersionCompletion(comp, "", NetworkPolicyTypeURL, nodeID, revertFunc)
+			} else {
+				// When all NPs are removed, the LinearCache won't send a response
+				// (non-full-state SotW doesn't respond for deletions-only), so
+				// complete immediately to avoid hanging forever.
+				comp.Complete(nil)
+			}
+		}
+		c.npdsCache.SetResources(newSnapshot.NetworkPolicies)
+	}
+
+	return nil
 }
 
 func (c CacheImpl) ClearSnapshot(nodeID string) {
@@ -332,6 +348,9 @@ func (c CacheImpl) ClearSnapshotForType(nodeID string, resourceType envoy_resour
 		c.logger.Error(fmt.Sprintf("Failed to set snapshot after clearing resources of type %s for node %s: %v", resourceType, nodeID, err))
 		return
 	}
+	if resourceType == NetworkPolicyTypeURL {
+		c.npdsCache.SetResources(map[string]cache_types.Resource{})
+	}
 }
 
 func (c CacheImpl) CreateDeltaWatch(*cache.DeltaRequest, cache.Subscription, chan cache.DeltaResponse) (cancel func(), err error) {
@@ -339,6 +358,10 @@ func (c CacheImpl) CreateDeltaWatch(*cache.DeltaRequest, cache.Subscription, cha
 }
 
 func (c CacheImpl) CreateWatch(request *cache.Request, sub cache.Subscription, respChan chan cache.Response) (cancel func(), err error) {
+	if request != nil && request.GetTypeUrl() == envoy_resource.SecretType && len(request.GetResourceNames()) == 0 {
+		c.logger.Debug("Ignoring empty ADS SDS watch")
+		return func() {}, nil
+	}
 	return c.mux.CreateWatch(request, sub, respChan)
 }
 
