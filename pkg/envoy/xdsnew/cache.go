@@ -9,14 +9,11 @@ import (
 	"hash"
 	"hash/fnv"
 	"log/slog"
+	"maps"
+	"slices"
+	"strings"
 
-	cilium "github.com/cilium/proxy/go/cilium/api"
 	"github.com/davecgh/go-spew/spew"
-	envoy_config_cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	envoy_config_endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	envoy_config_listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	cache_types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	envoy_resource "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -26,7 +23,6 @@ import (
 	"github.com/cilium/cilium/pkg/envoy/xds"
 	callbacks "github.com/cilium/cilium/pkg/envoy/xdsnew/callbacks"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 const (
@@ -39,134 +35,123 @@ type Cache interface {
 	cache.SnapshotCache
 
 	GetVersion(resources *xds.Resources) string
-	GenerateSnapshot(resources *xds.Resources, logger *slog.Logger) (*WrappedSnapshot, error)
-	UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot WrappedSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error
+	GenerateSnapshot(resources *xds.Resources, logger *slog.Logger) (cache.ResourceSnapshot, error)
+	UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error
 	SetResources(nodeID string, resources *xds.Resources)
-	ClearSnapshotForType(nodeID string, resourceType envoy_resource.Type)
 	GetAllResources(nodeID string) *xds.Resources
 	AreDifferentSnapshots(left, right cache.ResourceSnapshot) bool
 	GetCompletionCallbacks() *callbacks.CompletionCallbacks
-	GetNPHDSCache() *cache.LinearCache
 }
 
-type CacheImpl struct {
+type cacheImpl struct {
+	cache.SnapshotCache
+
 	// mutex protects accesses to the configuration resources below.
 	mutex *lock.RWMutex
 	// resourcesInSnapshot holds the last set of resources (keyed by nodeID) pushed to Envoy.
 	resourcesInSnapshot map[string]*xds.Resources
-	snapshotCache       cache.SnapshotCache
-	npdsCache           *cache.LinearCache
-	nphdsCache          *cache.LinearCache
-	mux                 cache.MuxCache
 	logger              *slog.Logger
 	hasher              hash.Hash32
 	completionCbs       callbacks.CompletionCallbacks
 }
 
-var _ Cache = &CacheImpl{}
+var _ Cache = &cacheImpl{}
 
-// WrappedSnapshot wraps the go-control-plane Snapshot and adds Cilium custom
-// resource types (NetworkPolicy, NetworkPolicyHosts) so that a single snapshot
-// can be stored per node and still serve all resource types.
-type WrappedSnapshot struct {
-	*cache.Snapshot
-
-	// NetworkPolicies stores cilium NetworkPolicy resources keyed by name.
-	NetworkPolicies map[string]cache_types.Resource
-	// networkPolicyVersion is the opaque version string for network policies.
-	networkPolicyVersion string
+// ciliumSnapshot implements go-control-plane's ResourceSnapshot interface for
+// both Envoy core resources and Cilium-specific xDS resources.
+type ciliumSnapshot struct {
+	Resources  map[string]cache.Resources
+	VersionMap map[string]map[string]string
 }
 
-// Ensure WrappedSnapshot implements cache.ResourceSnapshot.
-var _ cache.ResourceSnapshot = &WrappedSnapshot{}
+// Ensure ciliumSnapshot implements cache.ResourceSnapshot.
+var _ cache.ResourceSnapshot = &ciliumSnapshot{}
 
-func NewWrappedSnapshot(snapshot *cache.Snapshot, networkPolicies map[string]cache_types.Resource, version string) *WrappedSnapshot {
-	if networkPolicies == nil {
-		networkPolicies = make(map[string]cache_types.Resource)
-	}
-	return &WrappedSnapshot{
-		Snapshot:             snapshot,
-		NetworkPolicies:      networkPolicies,
-		networkPolicyVersion: version,
-	}
+var snapshotResourceTypes = []envoy_resource.Type{
+	envoy_resource.EndpointType,
+	envoy_resource.ClusterType,
+	envoy_resource.RouteType,
+	envoy_resource.ListenerType,
+	envoy_resource.SecretType,
+	NetworkPolicyTypeURL,
+	NetworkPolicyHostsTypeUrl,
 }
 
-func (w *WrappedSnapshot) GetVersion(typeURL string) string {
-	if typeURL == NetworkPolicyTypeURL {
-		return w.networkPolicyVersion
+func newCiliumSnapshot(resources map[string]cache.Resources) *ciliumSnapshot {
+	w := &ciliumSnapshot{
+		Resources: make(map[string]cache.Resources, len(snapshotResourceTypes)),
 	}
-	return w.Snapshot.GetVersion(typeURL)
+	for _, typeURL := range snapshotResourceTypes {
+		w.Resources[typeURL] = resources[typeURL]
+	}
+	return w
 }
 
-func (w *WrappedSnapshot) GetResources(typeURL string) map[string]cache_types.Resource {
-	if typeURL == NetworkPolicyTypeURL {
-		return w.NetworkPolicies
+func (w *ciliumSnapshot) GetVersion(typeURL string) string {
+	group, ok := w.Resources[typeURL]
+	if !ok {
+		return ""
 	}
-	return w.Snapshot.GetResources(typeURL)
+	return group.Version
 }
 
-func (w *WrappedSnapshot) GetResourcesAndTTL(typeURL string) map[string]cache_types.ResourceWithTTL {
-	if typeURL == NetworkPolicyTypeURL {
-		out := make(map[string]cache_types.ResourceWithTTL, len(w.NetworkPolicies))
-		for k, v := range w.NetworkPolicies {
-			out[k] = cache_types.ResourceWithTTL{Resource: v}
+func (w *ciliumSnapshot) GetResources(typeURL string) map[string]cache_types.Resource {
+	resources := w.GetResourcesAndTTL(typeURL)
+	if len(resources) == 0 {
+		return nil
+	}
+	out := make(map[string]cache_types.Resource, len(resources))
+	for name, resource := range resources {
+		out[name] = resource.Resource
+	}
+	return out
+}
+
+func (w *ciliumSnapshot) GetResourcesAndTTL(typeURL string) map[string]cache_types.ResourceWithTTL {
+	group, ok := w.Resources[typeURL]
+	if !ok {
+		return nil
+	}
+	return group.Items
+}
+
+func (w *ciliumSnapshot) ConstructVersionMap() error {
+	if w == nil {
+		return fmt.Errorf("missing snapshot")
+	}
+	if w.VersionMap != nil {
+		return nil
+	}
+
+	w.VersionMap = make(map[string]map[string]string, len(w.Resources))
+	for typeURL, group := range w.Resources {
+		if len(group.Items) == 0 {
+			continue
 		}
-		return out
-	}
-	return w.Snapshot.GetResourcesAndTTL(typeURL)
-}
-
-func (w *WrappedSnapshot) ConstructVersionMap() error {
-	return w.Snapshot.ConstructVersionMap()
-}
-
-func (w *WrappedSnapshot) GetVersionMap(typeURL string) map[string]string {
-	if typeURL == NetworkPolicyTypeURL {
-		out := make(map[string]string, len(w.NetworkPolicies))
-		for k := range w.NetworkPolicies {
-			out[k] = w.networkPolicyVersion
+		w.VersionMap[typeURL] = make(map[string]string, len(group.Items))
+		for name, resource := range group.Items {
+			marshaledResource, err := cache.MarshalResource(resource.Resource)
+			if err != nil {
+				return err
+			}
+			w.VersionMap[typeURL][name] = cache.HashResource(marshaledResource)
 		}
-		return out
 	}
-	return w.Snapshot.GetVersionMap(typeURL)
+	return nil
 }
 
-func NewCache(logger *slog.Logger) *CacheImpl {
+func (w *ciliumSnapshot) GetVersionMap(typeURL string) map[string]string {
+	if w == nil || w.VersionMap == nil {
+		return nil
+	}
+	return w.VersionMap[typeURL]
+}
+
+func NewCache(logger *slog.Logger) Cache {
 	snapshotCache := cache.NewSnapshotCache( /*ads*/ true, cache.IDHash{} /*logger*/, nil)
-	npdsCache := cache.NewLinearCache(NetworkPolicyTypeURL)
-	nphdsCache := cache.NewLinearCache(NetworkPolicyHostsTypeUrl)
 
-	return &CacheImpl{
-		snapshotCache: snapshotCache,
-		npdsCache:     npdsCache,
-		nphdsCache:    nphdsCache,
-		mux: cache.MuxCache{
-			Classify: func(req *cache.Request) string {
-				switch req.TypeUrl {
-				case NetworkPolicyTypeURL:
-					return "npds"
-				case NetworkPolicyHostsTypeUrl:
-					return "nphds"
-				default:
-					return "default"
-				}
-			},
-			ClassifyDelta: func(req *cache.DeltaRequest) string {
-				switch req.TypeUrl {
-				case NetworkPolicyTypeURL:
-					return "npds"
-				case NetworkPolicyHostsTypeUrl:
-					return "nphds"
-				default:
-					return "default"
-				}
-			},
-			Caches: map[string]cache.Cache{
-				"npds":    npdsCache,
-				"nphds":   nphdsCache,
-				"default": snapshotCache,
-			},
-		},
+	return &cacheImpl{
+		SnapshotCache:       snapshotCache,
 		mutex:               &lock.RWMutex{},
 		resourcesInSnapshot: make(map[string]*xds.Resources),
 		logger:              logger,
@@ -175,19 +160,19 @@ func NewCache(logger *slog.Logger) *CacheImpl {
 	}
 }
 
-func (c *CacheImpl) hash(resources map[string]string) string {
-	c.hasher.Reset()
+func (c *cacheImpl) hash(resources map[string]string) string {
+	hasher := fnv.New32a()
 	printer := spew.ConfigState{
 		Indent:         " ",
 		SortKeys:       true,
 		DisableMethods: true,
 		SpewKeys:       true,
 	}
-	printer.Fprintf(c.hasher, "%#v", resources)
-	return rand.SafeEncodeString(fmt.Sprint(c.hasher.Sum32()))
+	printer.Fprintf(hasher, "%#v", resources)
+	return rand.SafeEncodeString(fmt.Sprint(hasher.Sum32()))
 }
 
-func (c *CacheImpl) GetVersion(resources *xds.Resources) string {
+func (c *cacheImpl) GetVersion(resources *xds.Resources) string {
 	encodedResources, err := Marshal(resources)
 	if err != nil {
 		c.logger.Error(fmt.Sprintf("failed to marshal resources for versioning: %v", err))
@@ -196,13 +181,48 @@ func (c *CacheImpl) GetVersion(resources *xds.Resources) string {
 	return c.hash(encodedResources)
 }
 
-func (c *CacheImpl) GenerateSnapshot(resources *xds.Resources, logger *slog.Logger) (*WrappedSnapshot, error) {
-	endpoints := make([]cache_types.Resource, 0, len(resources.Endpoints))
-	clusters := make([]cache_types.Resource, 0, len(resources.Clusters))
-	routes := make([]cache_types.Resource, 0, len(resources.Routes))
-	listeners := make([]cache_types.Resource, 0, len(resources.Listeners))
+func resourceGroup(version string, resources map[string]cache_types.Resource) cache.Resources {
+	if len(resources) == 0 {
+		return cache.Resources{Version: version}
+	}
+	items := make(map[string]cache_types.ResourceWithTTL, len(resources))
+	for name, resource := range resources {
+		items[name] = cache_types.ResourceWithTTL{Resource: resource}
+	}
+	return cache.Resources{
+		Version: version,
+		Items:   items,
+	}
+}
+
+func (c *cacheImpl) resourceVersion(typeURL string, resources map[string]cache_types.Resource) (string, error) {
+	keys := slices.Collect(maps.Keys(resources))
+	slices.Sort(keys)
+	var sb strings.Builder
+	for _, name := range keys {
+		encodedResource, err := marshal(resources[name])
+		if err != nil {
+			return "", err
+		}
+		sb.WriteString(name)
+		sb.WriteString(encodedResource)
+	}
+	return c.hash(map[string]string{typeURL: sb.String()}), nil
+}
+
+func (c *cacheImpl) GenerateSnapshot(resources *xds.Resources, logger *slog.Logger) (cache.ResourceSnapshot, error) {
+	if resources == nil {
+		empty := xds.NewResources()
+		resources = &empty
+	}
+
+	endpoints := make(map[string]cache_types.Resource, len(resources.Endpoints))
+	clusters := make(map[string]cache_types.Resource, len(resources.Clusters))
+	routes := make(map[string]cache_types.Resource, len(resources.Routes))
+	listeners := make(map[string]cache_types.Resource, len(resources.Listeners))
 	networkPolicies := make(map[string]cache_types.Resource, len(resources.NetworkPolicies))
-	secrets := make([]cache_types.Resource, 0, len(resources.Secrets))
+	networkPolicyHosts := make(map[string]cache_types.Resource, len(resources.NetworkPolicyHosts))
+	secrets := make(map[string]cache_types.Resource, len(resources.Secrets))
 
 	for name, r := range resources.Endpoints {
 		// Skip wildcard :* endpoints that have no matching cluster,
@@ -212,87 +232,78 @@ func (c *CacheImpl) GenerateSnapshot(resources *xds.Resources, logger *slog.Logg
 		if _, hasCluster := resources.Clusters[name]; !hasCluster && len(name) > 2 && name[len(name)-2:] == ":*" {
 			continue
 		}
-		endpoints = append(endpoints, r)
+		endpoints[name] = r
 	}
-	for _, r := range resources.Clusters {
-		clusters = append(clusters, r)
+	for name, r := range resources.Clusters {
+		clusters[name] = r
 	}
-	for _, r := range resources.Routes {
-		routes = append(routes, r)
+	for name, r := range resources.Routes {
+		routes[name] = r
 	}
-	for _, r := range resources.Listeners {
-		listeners = append(listeners, r)
+	for name, r := range resources.Listeners {
+		listeners[name] = r
 	}
 	for name, r := range resources.NetworkPolicies {
 		networkPolicies[name] = r
 	}
-	for _, r := range resources.Secrets {
-		secrets = append(secrets, r)
+	for name, r := range resources.NetworkPolicyHosts {
+		networkPolicyHosts[name] = r
+	}
+	for name, r := range resources.Secrets {
+		secrets[name] = r
 	}
 
-	version := c.GetVersion(resources)
-
-	snapshot, err := cache.NewSnapshot(version, map[envoy_resource.Type][]cache_types.Resource{
+	resourceGroups := map[string]map[string]cache_types.Resource{
 		envoy_resource.EndpointType: endpoints,
 		envoy_resource.ClusterType:  clusters,
 		envoy_resource.RouteType:    routes,
 		envoy_resource.ListenerType: listeners,
 		envoy_resource.SecretType:   secrets,
-	})
-	if err != nil {
-		c.logger.Error("failed to generate snapshot: %q", logfields.Error, err)
-		return nil, err
+		NetworkPolicyTypeURL:        networkPolicies,
+		NetworkPolicyHostsTypeUrl:   networkPolicyHosts,
 	}
-	if err = snapshot.Consistent(); err != nil {
-		c.logger.Warn(fmt.Sprintf("Snapshot inconsistency detected (non-fatal): %q", err))
+
+	versionedResources := make(map[string]cache.Resources, len(resourceGroups))
+	for typeURL, resources := range resourceGroups {
+		version, err := c.resourceVersion(typeURL, resources)
+		if err != nil {
+			return nil, err
+		}
+		versionedResources[typeURL] = resourceGroup(version, resources)
 	}
-	wrappedSnapshot := NewWrappedSnapshot(snapshot, networkPolicies, version)
-	return wrappedSnapshot, nil
+
+	return newCiliumSnapshot(versionedResources), nil
 }
 
-func (c CacheImpl) GetSnapshot(nodeID string) (cache.ResourceSnapshot, error) {
-	snap, err := c.snapshotCache.GetSnapshot(nodeID)
-	if err != nil {
-		return &cache.Snapshot{}, err
-	}
-
-	return snap, nil
-}
-
-func (c *CacheImpl) GetCompletionCallbacks() *callbacks.CompletionCallbacks {
+func (c *cacheImpl) GetCompletionCallbacks() *callbacks.CompletionCallbacks {
 	return &c.completionCbs
 }
 
-func (c *CacheImpl) GetNPHDSCache() *cache.LinearCache {
-	return c.nphdsCache
-}
-
-func (c CacheImpl) SetResources(nodeID string, resources *xds.Resources) {
+func (c *cacheImpl) SetResources(nodeID string, resources *xds.Resources) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	c.resourcesInSnapshot[nodeID] = resources
 }
 
-func (c CacheImpl) SetSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot) error {
-	return c.snapshotCache.SetSnapshot(ctx, nodeID, newSnapshot)
-}
-
-func (c CacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot WrappedSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error {
+func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error {
 	addCompletion := func(wg *completion.WaitGroup, cb func(err error)) *completion.Completion {
 		return wg.AddCompletionWithCallback(nil, cb)
 	}
 
-	var completions []*completion.Completion
+	completions := make([]*completion.Completion, 0, len(updatedTypeURLS))
+	immediateCompletions := make([]*completion.Completion, 0, 1)
 	if wg != nil && len(updatedTypeURLS) > 0 {
 		for typeURL := range updatedTypeURLS {
-			// Custom Cilium resource types are processed below once resource
-			// versions have been computed by their linear caches.
-			if typeURL != NetworkPolicyTypeURL && typeURL != NetworkPolicyHostsTypeUrl {
-				comp := addCompletion(wg, callback)
-				completions = append(completions, comp)
-				c.completionCbs.AddTypeVersionCompletion(comp, newSnapshot.GetVersion(typeURL), typeURL, nodeID, revertFunc)
+			comp := addCompletion(wg, callback)
+			if typeURL == NetworkPolicyTypeURL && len(newSnapshot.GetResources(NetworkPolicyTypeURL)) == 0 {
+				immediateCompletions = append(immediateCompletions, comp)
+				continue
 			}
+			c.completionCbs.AddTypeVersionCompletion(comp, newSnapshot.GetVersion(typeURL), typeURL, nodeID, revertFunc)
+			completions = append(completions, comp)
 		}
 	}
-	err := c.snapshotCache.SetSnapshot(ctx, nodeID, newSnapshot.Snapshot)
+	err := c.SetSnapshot(ctx, nodeID, newSnapshot)
 
 	if err != nil {
 		for _, comp := range completions {
@@ -300,105 +311,51 @@ func (c CacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapsho
 		}
 		return err
 	}
-
-	if _, updated := updatedTypeURLS[NetworkPolicyTypeURL]; updated {
-		if wg != nil {
-			comp := addCompletion(wg, callback)
-			if len(newSnapshot.NetworkPolicies) > 0 {
-				// todo (nezdolik) Currently is not possible to get resource version from linear cache, instead version will be updated in OnStreamResponse callback.
-				// https://github.com/envoyproxy/go-control-plane/pull/1467
-				c.completionCbs.AddTypeVersionCompletion(comp, "", NetworkPolicyTypeURL, nodeID, revertFunc)
-			} else {
-				// When all NPs are removed, the LinearCache won't send a response
-				// (non-full-state SotW doesn't respond for deletions-only), so
-				// complete immediately to avoid hanging forever.
-				comp.Complete(nil)
-			}
-		}
-		c.npdsCache.SetResources(newSnapshot.NetworkPolicies)
+	for _, comp := range immediateCompletions {
+		comp.Complete(nil)
 	}
 
 	return nil
 }
 
-func (c CacheImpl) ClearSnapshot(nodeID string) {
-	c.snapshotCache.ClearSnapshot(nodeID)
+func (c *cacheImpl) ClearSnapshot(nodeID string) {
+	c.SnapshotCache.ClearSnapshot(nodeID)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	c.resourcesInSnapshot[nodeID] = &xds.Resources{}
 }
 
-func (c CacheImpl) ClearSnapshotForType(nodeID string, resourceType envoy_resource.Type) {
-	resources, exists := c.resourcesInSnapshot[nodeID]
-	if !exists {
-		c.logger.Warn(fmt.Sprintf("No resources found for node %s when clearing snapshot for resource type %s", nodeID, resourceType))
-		return
+func normalizeCustomWildcardRequest(request *cache.Request, sub cache.Subscription) *cache.Request {
+	if request == nil || sub == nil || !sub.IsWildcard() || len(request.GetResourceNames()) == 0 {
+		return request
 	}
-	switch resourceType {
-	case envoy_resource.EndpointType:
-		resources.Endpoints = map[string]*envoy_config_endpoint.ClusterLoadAssignment{}
-	case envoy_resource.ClusterType:
-		resources.Clusters = map[string]*envoy_config_cluster.Cluster{}
-	case envoy_resource.RouteType:
-		resources.Routes = map[string]*envoy_config_route.RouteConfiguration{}
-	case envoy_resource.ListenerType:
-		resources.Listeners = map[string]*envoy_config_listener.Listener{}
-	case envoy_resource.SecretType:
-		resources.Secrets = map[string]*envoy_config_tls.Secret{}
-	case NetworkPolicyTypeURL:
-		resources.NetworkPolicies = map[string]*cilium.NetworkPolicy{}
+	switch request.GetTypeUrl() {
+	case NetworkPolicyTypeURL, NetworkPolicyHostsTypeUrl:
+		normalized := *request
+		normalized.ResourceNames = nil
+		return &normalized
 	default:
-		c.logger.Warn(fmt.Sprintf("Clearing snapshot for resource type %s is not supported", resourceType))
-	}
-	newSnapshot, err := c.GenerateSnapshot(resources, c.logger)
-	if err != nil {
-		c.logger.Error(fmt.Sprintf("Failed to generate snapshot after clearing resources of type %s for node %s: %v", resourceType, nodeID, err))
-		return
-	}
-	if err = c.SetSnapshot(context.Background(), nodeID, newSnapshot); err != nil {
-		c.logger.Error(fmt.Sprintf("Failed to set snapshot after clearing resources of type %s for node %s: %v", resourceType, nodeID, err))
-		return
-	}
-	if resourceType == NetworkPolicyTypeURL {
-		c.npdsCache.SetResources(map[string]cache_types.Resource{})
+		return request
 	}
 }
 
-func (c CacheImpl) CreateDeltaWatch(*cache.DeltaRequest, cache.Subscription, chan cache.DeltaResponse) (cancel func(), err error) {
-	panic("unimplemented")
-}
-
-func (c CacheImpl) CreateWatch(request *cache.Request, sub cache.Subscription, respChan chan cache.Response) (cancel func(), err error) {
+func (c *cacheImpl) CreateWatch(request *cache.Request, sub cache.Subscription, respChan chan cache.Response) (cancel func(), err error) {
 	if request != nil && request.GetTypeUrl() == envoy_resource.SecretType && len(request.GetResourceNames()) == 0 {
 		c.logger.Debug("Ignoring empty ADS SDS watch")
 		return func() {}, nil
 	}
-	return c.mux.CreateWatch(request, sub, respChan)
+	request = normalizeCustomWildcardRequest(request, sub)
+	return c.SnapshotCache.CreateWatch(request, sub, respChan)
 }
 
-// Fetch implements cache.SnapshotCache.
-func (c CacheImpl) Fetch(context context.Context, request *cache.Request) (cache.Response, error) {
-	return c.mux.Fetch(context, request)
-}
-
-// GetStatusInfo implements cache.SnapshotCache.
-func (c CacheImpl) GetStatusInfo(node string) cache.StatusInfo {
-	return c.snapshotCache.GetStatusInfo(node)
-}
-
-func (c CacheImpl) GetAllResources(nodeID string) *xds.Resources {
+func (c *cacheImpl) GetAllResources(nodeID string) *xds.Resources {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 	return c.resourcesInSnapshot[nodeID]
 }
 
-// GetStatusKeys implements cache.SnapshotCache.
-func (c CacheImpl) GetStatusKeys() []string {
-	return c.snapshotCache.GetStatusKeys()
-}
-
-// todo(nezdolik) switch to wrappedsnapshot
-func (c CacheImpl) AreDifferentSnapshots(left, right cache.ResourceSnapshot) bool {
-	for _, resourceType := range []envoy_resource.Type{
-		envoy_resource.EndpointType, envoy_resource.ClusterType, envoy_resource.RouteType,
-		envoy_resource.ListenerType, envoy_resource.SecretType,
-	} {
+func (c *cacheImpl) AreDifferentSnapshots(left, right cache.ResourceSnapshot) bool {
+	for _, resourceType := range snapshotResourceTypes {
 		if left.GetVersion(resourceType) != right.GetVersion(resourceType) {
 			return true
 		}

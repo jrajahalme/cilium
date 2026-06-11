@@ -738,8 +738,17 @@ func (s *adsServer) RemoveNetworkPolicy(ctx context.Context, ep endpoint.Endpoin
 func (s *adsServer) RemoveAllNetworkPolicies() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	// Host proxy uses "127.0.0.1" as the nodeID
-	s.cache.ClearSnapshotForType(localNodeID, NetworkPolicyTypeURL)
+
+	resources := s.cache.GetAllResources(localNodeID)
+	if resources == nil {
+		return
+	}
+	newResources := resources.DeepCopy()
+	newResources.NetworkPolicies = map[string]*cilium.NetworkPolicy{}
+
+	if err := s.updateSnapshot(context.Background(), newResources, localNodeID, nil, nil, computeChanges(resources, newResources)); err != nil {
+		s.logger.Error("Failed to remove all network policies", logfields.Error, err)
+	}
 }
 
 func (s *adsServer) GetNetworkPolicies(resourceNames []string) (map[string]*cilium.NetworkPolicy, error) {
@@ -797,12 +806,13 @@ func (s *adsServer) portAllocationCallback(ctx context.Context, callbacks map[st
 // Each slice records the old value for keys being modified. Used by buildRevert to
 // restore only the changed resources on NACK, instead of reverting the entire snapshot.
 type resourceChanges struct {
-	listeners       []savedEntry[*envoy_config_listener.Listener]
-	routes          []savedEntry[*envoy_config_route.RouteConfiguration]
-	clusters        []savedEntry[*envoy_config_cluster.Cluster]
-	endpoints       []savedEntry[*envoy_config_endpoint.ClusterLoadAssignment]
-	secrets         []savedEntry[*envoy_config_tls.Secret]
-	networkPolicies []savedEntry[*cilium.NetworkPolicy]
+	listeners          []savedEntry[*envoy_config_listener.Listener]
+	routes             []savedEntry[*envoy_config_route.RouteConfiguration]
+	clusters           []savedEntry[*envoy_config_cluster.Cluster]
+	endpoints          []savedEntry[*envoy_config_endpoint.ClusterLoadAssignment]
+	secrets            []savedEntry[*envoy_config_tls.Secret]
+	networkPolicies    []savedEntry[*cilium.NetworkPolicy]
+	networkPolicyHosts []savedEntry[*cilium.NetworkPolicyHosts]
 }
 
 // computeChanges builds a resourceChanges by diffing current and new resources.
@@ -811,12 +821,13 @@ func computeChanges(current, new *xds.Resources) *resourceChanges {
 		current = &xds.Resources{}
 	}
 	return &resourceChanges{
-		listeners:       diffMap(current.Listeners, new.Listeners),
-		routes:          diffMap(current.Routes, new.Routes),
-		clusters:        diffMap(current.Clusters, new.Clusters),
-		endpoints:       diffMap(current.Endpoints, new.Endpoints),
-		secrets:         diffMap(current.Secrets, new.Secrets),
-		networkPolicies: diffMap(current.NetworkPolicies, new.NetworkPolicies),
+		listeners:          diffMap(current.Listeners, new.Listeners),
+		routes:             diffMap(current.Routes, new.Routes),
+		clusters:           diffMap(current.Clusters, new.Clusters),
+		endpoints:          diffMap(current.Endpoints, new.Endpoints),
+		secrets:            diffMap(current.Secrets, new.Secrets),
+		networkPolicies:    diffMap(current.NetworkPolicies, new.NetworkPolicies),
+		networkPolicyHosts: diffMap(current.NetworkPolicyHosts, new.NetworkPolicyHosts),
 	}
 }
 
@@ -858,6 +869,7 @@ func (s *adsServer) buildRevert(ctx context.Context, nodeID string, newResources
 		applyDiff(reverted.Endpoints, changes.endpoints)
 		applyDiff(reverted.Secrets, changes.secrets)
 		applyDiff(reverted.NetworkPolicies, changes.networkPolicies)
+		applyDiff(reverted.NetworkPolicyHosts, changes.networkPolicyHosts)
 
 		revertChanges := computeChanges(currentResources, reverted)
 		if err := s.updateSnapshot(ctx, reverted, nodeID, nil, nil, revertChanges); err != nil {
@@ -938,6 +950,10 @@ func (s *adsServer) updateSnapshot(ctx context.Context, resources *xds.Resources
 		}
 		if len(resources.NetworkPolicies) > 0 {
 			msg += fmt.Sprintf("%s%d network policies", sep, len(resources.NetworkPolicies))
+			sep = ", "
+		}
+		if len(resources.NetworkPolicyHosts) > 0 {
+			msg += fmt.Sprintf("%s%d network policy hosts", sep, len(resources.NetworkPolicyHosts))
 		}
 
 		s.logger.Debug(
@@ -999,7 +1015,7 @@ func (s *adsServer) updateSnapshot(ctx context.Context, resources *xds.Resources
 		if len(callback) > 0 {
 			cb = callback[0]
 		}
-		err = s.cache.UpdateSnapshot(ctx, nodeId, *newSnapshot, wg, updatedTypeURLsInSnapshot, revertFunc, cb)
+		err = s.cache.UpdateSnapshot(ctx, nodeId, newSnapshot, wg, updatedTypeURLsInSnapshot, revertFunc, cb)
 		if err != nil {
 			s.logger.Error("Error setting snapshot for node %s: %q",
 				logfields.NodeID, nodeId,
@@ -1130,17 +1146,19 @@ func mergeResources(dst *xds.Resources, src *xds.Resources) {
 	maps.Copy(dst.Endpoints, src.Endpoints)
 	maps.Copy(dst.Secrets, src.Secrets)
 	maps.Copy(dst.NetworkPolicies, src.NetworkPolicies)
+	maps.Copy(dst.NetworkPolicyHosts, src.NetworkPolicyHosts)
 }
 
 // Subtracts all resources present in b from a.
 func subtractResources(a *xds.Resources, b *xds.Resources) xds.Resources {
 	diffResources := xds.Resources{
-		Listeners:       make(map[string]*envoy_config_listener.Listener),
-		Clusters:        make(map[string]*envoy_config_cluster.Cluster),
-		Routes:          make(map[string]*envoy_config_route.RouteConfiguration),
-		Endpoints:       make(map[string]*envoy_config_endpoint.ClusterLoadAssignment),
-		Secrets:         make(map[string]*envoy_config_tls.Secret),
-		NetworkPolicies: make(map[string]*cilium.NetworkPolicy),
+		Listeners:          make(map[string]*envoy_config_listener.Listener),
+		Clusters:           make(map[string]*envoy_config_cluster.Cluster),
+		Routes:             make(map[string]*envoy_config_route.RouteConfiguration),
+		Endpoints:          make(map[string]*envoy_config_endpoint.ClusterLoadAssignment),
+		Secrets:            make(map[string]*envoy_config_tls.Secret),
+		NetworkPolicies:    make(map[string]*cilium.NetworkPolicy),
+		NetworkPolicyHosts: make(map[string]*cilium.NetworkPolicyHosts),
 	}
 	if a == nil || b == nil {
 		return diffResources
@@ -1179,6 +1197,11 @@ func subtractResources(a *xds.Resources, b *xds.Resources) xds.Resources {
 	for name, nwPolicy := range a.NetworkPolicies {
 		if _, present := b.NetworkPolicies[name]; !present {
 			diffResources.NetworkPolicies[name] = nwPolicy
+		}
+	}
+	for name, nwPolicyHosts := range a.NetworkPolicyHosts {
+		if _, present := b.NetworkPolicyHosts[name]; !present {
+			diffResources.NetworkPolicyHosts[name] = nwPolicyHosts
 		}
 	}
 
@@ -1223,6 +1246,9 @@ func getUpdatedTypeURLs(changes *resourceChanges) map[string]struct{} {
 	}
 	if len(changes.networkPolicies) > 0 {
 		updatedTypeURLS[NetworkPolicyTypeURL] = struct{}{}
+	}
+	if len(changes.networkPolicyHosts) > 0 {
+		updatedTypeURLS[NetworkPolicyHostsTypeURL] = struct{}{}
 	}
 	return updatedTypeURLS
 }

@@ -20,13 +20,13 @@ import (
 	envoy_config_listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-	cache_types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	envoy_resource "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
 
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/envoy/xds"
+	"github.com/cilium/cilium/pkg/lock"
 )
 
 type mockSnapshotCache struct {
@@ -41,6 +41,7 @@ type mockSnapshotCache struct {
 	getStatusInfoCalls []string
 	getStatusKeysCalls int
 	createWatchCalls   int
+	createDeltaCalls   int
 	fetchCalls         int
 }
 
@@ -101,6 +102,7 @@ func (m *mockSnapshotCache) CreateWatch(request *cache.Request, sub cache.Subscr
 }
 
 func (m *mockSnapshotCache) CreateDeltaWatch(request *cache.DeltaRequest, sub cache.Subscription, respChan chan cache.DeltaResponse) (cancel func(), err error) {
+	m.createDeltaCalls++
 	return func() {}, nil
 }
 
@@ -110,40 +112,41 @@ func (m *mockSnapshotCache) Fetch(ctx context.Context, request *cache.Request) (
 }
 
 // helper to build a Cache with a mocked snapshotCache
-func newTestCache(mockedCache *mockSnapshotCache) CacheImpl {
+func newTestCache(mockedCache *mockSnapshotCache) cacheImpl {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return CacheImpl{
-		snapshotCache:       mockedCache,
+	return cacheImpl{
+		SnapshotCache:       mockedCache,
+		mutex:               &lock.RWMutex{},
 		resourcesInSnapshot: make(map[string]*xds.Resources),
 		logger:              logger,
 		hasher:              nil, // not needed for tests that don't call hash/GetVersion
 	}
 }
 
-func newTestCacheWithHasher(mock *mockSnapshotCache) *CacheImpl {
-	c := NewCache(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	c.snapshotCache = mock
-	c.mux.Caches["default"] = mock
+func newTestCacheWithHasher(mock *mockSnapshotCache) *cacheImpl {
+	c := NewCache(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))).(*cacheImpl)
+	c.SnapshotCache = mock
 	c.resourcesInSnapshot = make(map[string]*xds.Resources)
 	return c
 }
 
 func emptyResources() *xds.Resources {
 	return &xds.Resources{
-		Listeners:       make(map[string]*envoy_config_listener.Listener),
-		Clusters:        make(map[string]*envoy_config_cluster.Cluster),
-		Routes:          make(map[string]*envoy_config_route.RouteConfiguration),
-		Endpoints:       make(map[string]*envoy_config_endpoint.ClusterLoadAssignment),
-		Secrets:         make(map[string]*envoy_config_tls.Secret),
-		NetworkPolicies: make(map[string]*cilium.NetworkPolicy),
+		Listeners:          make(map[string]*envoy_config_listener.Listener),
+		Clusters:           make(map[string]*envoy_config_cluster.Cluster),
+		Routes:             make(map[string]*envoy_config_route.RouteConfiguration),
+		Endpoints:          make(map[string]*envoy_config_endpoint.ClusterLoadAssignment),
+		Secrets:            make(map[string]*envoy_config_tls.Secret),
+		NetworkPolicies:    make(map[string]*cilium.NetworkPolicy),
+		NetworkPolicyHosts: make(map[string]*cilium.NetworkPolicyHosts),
 	}
 }
 
 func TestNewCache(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	c := NewCache(logger)
+	c := NewCache(logger).(*cacheImpl)
 
-	assert.NotNil(t, c.snapshotCache)
+	assert.NotNil(t, c.SnapshotCache)
 	assert.NotNil(t, c.logger)
 	assert.NotNil(t, c.hasher)
 }
@@ -164,23 +167,18 @@ func TestGetSnapshot_ExistingNode(t *testing.T) {
 	assert.Len(t, listenersInSnapshot, 1)
 
 	endpointsInSnapshot := snap.GetResources(envoy_resource.EndpointType)
-	assert.NotNil(t, endpointsInSnapshot)
 	assert.Empty(t, endpointsInSnapshot)
 
 	clustersInSnapshot := snap.GetResources(envoy_resource.ClusterType)
-	assert.NotNil(t, clustersInSnapshot)
 	assert.Empty(t, clustersInSnapshot)
 
 	routesInSnapshot := snap.GetResources(envoy_resource.RouteType)
-	assert.NotNil(t, routesInSnapshot)
 	assert.Empty(t, routesInSnapshot)
 
 	secretsInSnapshot := snap.GetResources(envoy_resource.SecretType)
-	assert.NotNil(t, secretsInSnapshot)
 	assert.Empty(t, secretsInSnapshot)
 
 	networkPoliciesInSnapshot := snap.GetResources(NetworkPolicyTypeURL)
-	assert.NotNil(t, networkPoliciesInSnapshot)
 	assert.Empty(t, networkPoliciesInSnapshot)
 
 	err = c.SetSnapshot(context.Background(), "node1", snap)
@@ -202,8 +200,7 @@ func TestGetSnapshot_NonExistingNode(t *testing.T) {
 
 	result, err := c.GetSnapshot("nonexistent")
 	require.Error(t, err)
-	// When node does not exist, Cache returns an empty Snapshot and an error
-	assert.NotNil(t, result)
+	assert.Nil(t, result)
 
 	require.Len(t, mock.getSnapshotCalls, 1)
 	assert.Equal(t, "nonexistent", mock.getSnapshotCalls[0])
@@ -339,78 +336,6 @@ func TestClearSnapshot(t *testing.T) {
 	assert.Empty(t, stored.Clusters)
 }
 
-func TestClearSnapshotForType_AllTypes(t *testing.T) {
-	mock := newMockSnapshotCache()
-	c := newTestCacheWithHasher(mock)
-
-	resources := emptyResources()
-	resources.Endpoints["ep1"] = &envoy_config_endpoint.ClusterLoadAssignment{ClusterName: "cluster1"}
-	resources.Clusters["cluster1"] = &envoy_config_cluster.Cluster{Name: "cluster1"}
-	resources.Listeners["listener1"] = &envoy_config_listener.Listener{Name: "listener1"}
-	resources.Secrets["secret1"] = &envoy_config_tls.Secret{Name: "secret1"}
-	resources.NetworkPolicies["np1"] = &cilium.NetworkPolicy{EndpointId: 1}
-	c.resourcesInSnapshot["node1"] = resources
-
-	c.ClearSnapshotForType("node1", envoy_resource.EndpointType)
-	c.ClearSnapshotForType("node1", envoy_resource.ClusterType)
-	c.ClearSnapshotForType("node1", envoy_resource.ListenerType)
-	c.ClearSnapshotForType("node1", envoy_resource.SecretType)
-	c.ClearSnapshotForType("node1", NetworkPolicyTypeURL)
-
-	stored := c.resourcesInSnapshot["node1"]
-	require.NotNil(t, stored)
-	assert.Empty(t, stored.Endpoints)
-	assert.Empty(t, stored.Routes)
-	assert.Empty(t, stored.Clusters)
-
-	assert.Empty(t, stored.Listeners)
-	assert.Empty(t, stored.Secrets)
-	assert.Empty(t, stored.NetworkPolicies)
-}
-
-func TestClearSnapshotForType_NonExistingNode(t *testing.T) {
-	mock := newMockSnapshotCache()
-	c := newTestCacheWithHasher(mock)
-
-	// Should not panic; logs a warning
-	c.ClearSnapshotForType("nonexistent", envoy_resource.ListenerType)
-
-	// No SetSnapshot calls should have been made
-	assert.Empty(t, mock.setSnapshotCalls)
-}
-
-func TestClearSnapshotForType_SetSnapshotError(t *testing.T) {
-	mock := newMockSnapshotCache()
-	mock.setSnapshotErr = fmt.Errorf("set error")
-	c := newTestCacheWithHasher(mock)
-
-	resources := emptyResources()
-	resources.Listeners["listener1"] = &envoy_config_listener.Listener{Name: "listener1"}
-	c.resourcesInSnapshot["node1"] = resources
-
-	// Should not panic even if SetSnapshot fails
-	c.ClearSnapshotForType("node1", envoy_resource.ListenerType)
-
-	// SetSnapshot was attempted
-	require.NotEmpty(t, mock.setSnapshotCalls)
-}
-
-func TestClearSnapshotForType_ClearsNetworkPolicyCache(t *testing.T) {
-	mock := newMockSnapshotCache()
-	c := newTestCacheWithHasher(mock)
-
-	resources := emptyResources()
-	resources.NetworkPolicies["np1"] = &cilium.NetworkPolicy{EndpointId: 1}
-	c.resourcesInSnapshot["node1"] = resources
-	c.npdsCache.SetResources(map[string]cache_types.Resource{
-		"np1": resources.NetworkPolicies["np1"],
-	})
-
-	c.ClearSnapshotForType("node1", NetworkPolicyTypeURL)
-
-	assert.Empty(t, c.npdsCache.GetResources())
-}
-
 func TestGenerateSnapshot_WithAllResourceTypes(t *testing.T) {
 	mock := newMockSnapshotCache()
 	c := newTestCacheWithHasher(mock)
@@ -436,7 +361,7 @@ func TestGenerateSnapshot_WithAllResourceTypes(t *testing.T) {
 	assert.Len(t, snap.GetResources(envoy_resource.SecretType), 1)
 }
 
-func TestUpdateSnapshot_UpdatesNetworkPolicyCacheWhenTypeChanged(t *testing.T) {
+func TestUpdateSnapshot_StoresNetworkPoliciesWhenTypeChanged(t *testing.T) {
 	mock := newMockSnapshotCache()
 	c := newTestCacheWithHasher(mock)
 
@@ -445,47 +370,47 @@ func TestUpdateSnapshot_UpdatesNetworkPolicyCacheWhenTypeChanged(t *testing.T) {
 	snap, err := c.GenerateSnapshot(resources, c.logger)
 	require.NoError(t, err)
 
-	err = c.UpdateSnapshot(context.Background(), "node1", *snap, nil,
+	err = c.UpdateSnapshot(context.Background(), "node1", snap, nil,
 		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, nil)
 	require.NoError(t, err)
 
-	policies := c.npdsCache.GetResources()
+	require.Len(t, mock.setSnapshotCalls, 1)
+	policies := mock.setSnapshotCalls[0].snapshot.GetResources(NetworkPolicyTypeURL)
 	require.Contains(t, policies, "np1")
 	assert.Equal(t, resources.NetworkPolicies["np1"], policies["np1"])
 }
 
-func TestUpdateSnapshot_ClearsNetworkPolicyCacheWhenTypeChangedToEmpty(t *testing.T) {
+func TestUpdateSnapshot_ClearsNetworkPoliciesWhenTypeChangedToEmpty(t *testing.T) {
 	mock := newMockSnapshotCache()
 	c := newTestCacheWithHasher(mock)
-	c.npdsCache.SetResources(map[string]cache_types.Resource{
-		"np1": &cilium.NetworkPolicy{EndpointId: 1},
-	})
 
 	resources := emptyResources()
 	snap, err := c.GenerateSnapshot(resources, c.logger)
 	require.NoError(t, err)
 
-	err = c.UpdateSnapshot(context.Background(), "node1", *snap, nil,
+	err = c.UpdateSnapshot(context.Background(), "node1", snap, nil,
 		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, nil)
 	require.NoError(t, err)
 
-	assert.Empty(t, c.npdsCache.GetResources())
+	require.Len(t, mock.setSnapshotCalls, 1)
+	assert.Empty(t, mock.setSnapshotCalls[0].snapshot.GetResources(NetworkPolicyTypeURL))
 }
 
-func TestUpdateSnapshot_DoesNotTouchNetworkPolicyCacheWithoutTypeChange(t *testing.T) {
+func TestUpdateSnapshot_StoresNetworkPoliciesWithoutTypeChange(t *testing.T) {
 	mock := newMockSnapshotCache()
 	c := newTestCacheWithHasher(mock)
-	policy := &cilium.NetworkPolicy{EndpointId: 1}
-	c.npdsCache.SetResources(map[string]cache_types.Resource{"np1": policy})
 
 	resources := emptyResources()
+	policy := &cilium.NetworkPolicy{EndpointId: 1}
+	resources.NetworkPolicies["np1"] = policy
 	snap, err := c.GenerateSnapshot(resources, c.logger)
 	require.NoError(t, err)
 
-	err = c.UpdateSnapshot(context.Background(), "node1", *snap, nil, nil, nil, nil)
+	err = c.UpdateSnapshot(context.Background(), "node1", snap, nil, nil, nil, nil)
 	require.NoError(t, err)
 
-	policies := c.npdsCache.GetResources()
+	require.Len(t, mock.setSnapshotCalls, 1)
+	policies := mock.setSnapshotCalls[0].snapshot.GetResources(NetworkPolicyTypeURL)
 	require.Contains(t, policies, "np1")
 	assert.Equal(t, policy, policies["np1"])
 }
@@ -502,7 +427,7 @@ func TestUpdateSnapshot_RegistersNetworkPolicyCompletionForPolicyChange(t *testi
 	wg := completion.NewWaitGroup(context.Background())
 	defer wg.Cancel()
 
-	err = c.UpdateSnapshot(context.Background(), "node1", *snap, wg,
+	err = c.UpdateSnapshot(context.Background(), "node1", snap, wg,
 		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, nil)
 	require.NoError(t, err)
 
@@ -642,13 +567,14 @@ func TestCreateWatch_IgnoresEmptySecretSubscription(t *testing.T) {
 
 // --- CreateDeltaWatch ---
 
-func TestCreateDeltaWatch_Panics(t *testing.T) {
+func TestCreateDeltaWatch_DelegatesToSnapshotCache(t *testing.T) {
 	mock := newMockSnapshotCache()
 	c := newTestCache(mock)
 
-	assert.Panics(t, func() {
-		c.CreateDeltaWatch(nil, nil, nil)
-	})
+	cancel, err := c.CreateDeltaWatch(nil, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, cancel)
+	assert.Equal(t, 1, mock.createDeltaCalls)
 }
 
 // --- Fetch ---
@@ -858,6 +784,3 @@ func TestGetAllResources_DoesNotCallSnapshotCache(t *testing.T) {
 	assert.Empty(t, mock.getSnapshotCalls)
 	assert.Empty(t, mock.clearSnapshotCalls)
 }
-
-// Ensure unused import suppression
-var _ cache_types.Resource

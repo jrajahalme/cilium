@@ -69,7 +69,7 @@ func (s *adsServer) startAdsGRPCServer(ctx context.Context) error {
 	)
 
 	// Start listening to IPCache events to populate NPHDS resources.
-	startNPHDSIPCacheListener(s.logger, s.ipCache, s.cache.GetNPHDSCache())
+	startNPHDSIPCacheListener(s.logger, s.ipCache, s)
 
 	if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
 		s.logger.Error("Envoy: Failed to serve xDS gRPC API",

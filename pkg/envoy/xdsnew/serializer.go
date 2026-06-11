@@ -109,8 +109,17 @@ func Marshal(resources *xds.Resources) (map[string]string, error) {
 	for k := range resources.NetworkPolicies {
 		npKeys = append(npKeys, k)
 	}
-	marshalSorted(envoy_resource.ExtensionConfigType, npKeys, func(k string) string {
+	marshalSorted(NetworkPolicyTypeURL, npKeys, func(k string) string {
 		s, _ := marshal(resources.NetworkPolicies[k])
+		return s
+	})
+
+	nphKeys := make([]string, 0, len(resources.NetworkPolicyHosts))
+	for k := range resources.NetworkPolicyHosts {
+		nphKeys = append(nphKeys, k)
+	}
+	marshalSorted(NetworkPolicyHostsTypeUrl, nphKeys, func(k string) string {
+		s, _ := marshal(resources.NetworkPolicyHosts[k])
 		return s
 	})
 
@@ -119,12 +128,13 @@ func Marshal(resources *xds.Resources) (map[string]string, error) {
 
 func Unmarshal(encodedResources map[string]string) (xds.Resources, error) {
 	resources := xds.Resources{
-		Endpoints:       map[string]*endpoint.ClusterLoadAssignment{},
-		Clusters:        map[string]*cluster.Cluster{},
-		Routes:          map[string]*route.RouteConfiguration{},
-		Listeners:       map[string]*listener.Listener{},
-		Secrets:         map[string]*secret.Secret{},
-		NetworkPolicies: map[string]*cilium.NetworkPolicy{},
+		Endpoints:          map[string]*endpoint.ClusterLoadAssignment{},
+		Clusters:           map[string]*cluster.Cluster{},
+		Routes:             map[string]*route.RouteConfiguration{},
+		Listeners:          map[string]*listener.Listener{},
+		Secrets:            map[string]*secret.Secret{},
+		NetworkPolicies:    map[string]*cilium.NetworkPolicy{},
+		NetworkPolicyHosts: map[string]*cilium.NetworkPolicyHosts{},
 		// PortAllocationCallbacks: nil,
 	}
 	for resourceType, resource := range encodedResources {

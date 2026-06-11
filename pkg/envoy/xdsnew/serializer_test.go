@@ -27,12 +27,13 @@ func TestMarshalUnmarshalEmptyResources(t *testing.T) {
 	require := require.New(t)
 
 	resources := xds.Resources{
-		Endpoints:       map[string]*endpoint.ClusterLoadAssignment{},
-		Clusters:        map[string]*cluster.Cluster{},
-		Routes:          map[string]*route.RouteConfiguration{},
-		Listeners:       map[string]*listener.Listener{},
-		Secrets:         map[string]*secret.Secret{},
-		NetworkPolicies: map[string]*cilium.NetworkPolicy{},
+		Endpoints:          map[string]*endpoint.ClusterLoadAssignment{},
+		Clusters:           map[string]*cluster.Cluster{},
+		Routes:             map[string]*route.RouteConfiguration{},
+		Listeners:          map[string]*listener.Listener{},
+		Secrets:            map[string]*secret.Secret{},
+		NetworkPolicies:    map[string]*cilium.NetworkPolicy{},
+		NetworkPolicyHosts: map[string]*cilium.NetworkPolicyHosts{},
 	}
 
 	encodedResources, err := Marshal(&resources)
@@ -79,8 +80,9 @@ func TestMarshalUnmarshalResources(t *testing.T) {
 				Name: "routeConfig1",
 			},
 		},
-		Endpoints:       map[string]*envoy_config_endpoint.ClusterLoadAssignment{},
-		NetworkPolicies: map[string]*cilium.NetworkPolicy{},
+		Endpoints:          map[string]*envoy_config_endpoint.ClusterLoadAssignment{},
+		NetworkPolicies:    map[string]*cilium.NetworkPolicy{},
+		NetworkPolicyHosts: map[string]*cilium.NetworkPolicyHosts{},
 	}
 
 	encodedResources, err := Marshal(&resources)

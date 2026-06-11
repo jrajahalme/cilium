@@ -71,12 +71,13 @@ type XDSServer interface {
 // Resources contains all Envoy resources parsed from a CiliumEnvoyConfig CRD.
 // Each resource type is stored in a map keyed by resource name.
 type Resources struct {
-	Listeners       map[string]*envoy_config_listener.Listener
-	Secrets         map[string]*envoy_config_tls.Secret
-	Routes          map[string]*envoy_config_route.RouteConfiguration
-	Clusters        map[string]*envoy_config_cluster.Cluster
-	Endpoints       map[string]*envoy_config_endpoint.ClusterLoadAssignment
-	NetworkPolicies map[string]*cilium.NetworkPolicy
+	Listeners          map[string]*envoy_config_listener.Listener
+	Secrets            map[string]*envoy_config_tls.Secret
+	Routes             map[string]*envoy_config_route.RouteConfiguration
+	Clusters           map[string]*envoy_config_cluster.Cluster
+	Endpoints          map[string]*envoy_config_endpoint.ClusterLoadAssignment
+	NetworkPolicies    map[string]*cilium.NetworkPolicy
+	NetworkPolicyHosts map[string]*cilium.NetworkPolicyHosts
 
 	// Callback functions that are called if the corresponding Listener change was successfully acked by Envoy
 	PortAllocationCallbacks map[string]func(context.Context) error `json:"-" yaml:"-"`
@@ -91,6 +92,7 @@ func NewResources() Resources {
 		Clusters:                make(map[string]*envoy_config_cluster.Cluster),
 		Endpoints:               make(map[string]*envoy_config_endpoint.ClusterLoadAssignment),
 		NetworkPolicies:         make(map[string]*cilium.NetworkPolicy),
+		NetworkPolicyHosts:      make(map[string]*cilium.NetworkPolicyHosts),
 		PortAllocationCallbacks: make(map[string]func(context.Context) error),
 	}
 }
@@ -115,6 +117,7 @@ func (r *Resources) DeepCopy() *Resources {
 		Clusters:                cloneOrInit(r.Clusters),
 		Endpoints:               cloneOrInit(r.Endpoints),
 		NetworkPolicies:         cloneOrInit(r.NetworkPolicies),
+		NetworkPolicyHosts:      cloneOrInit(r.NetworkPolicyHosts),
 		PortAllocationCallbacks: cloneOrInit(r.PortAllocationCallbacks),
 	}
 }

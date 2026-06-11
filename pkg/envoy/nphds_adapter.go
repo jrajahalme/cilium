@@ -4,43 +4,46 @@
 package envoy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net"
 	"slices"
 
 	envoyAPI "github.com/cilium/proxy/go/cilium/api"
-	cache_types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
-	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/envoy/xds"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
-// nphdsCacheAdapter bridges the IPCache and the go-control-plane
-// LinearCache used for NPHDS in the ADS implementation.
+type nphdsResourceStore interface {
+	networkPolicyHosts() map[string]*envoyAPI.NetworkPolicyHosts
+	updateNetworkPolicyHosts(context.Context, func(map[string]*envoyAPI.NetworkPolicyHosts) (bool, error)) error
+}
+
+// nphdsCacheAdapter bridges the IPCache and the ADS cache's NPHDS resources.
 // It implements ipcache.IPIdentityMappingListener.
 type nphdsCacheAdapter struct {
 	logger *slog.Logger
-	cache  *cache.LinearCache
+	store  nphdsResourceStore
 	mutex  lock.Mutex
 }
 
 var _ ipcache.IPIdentityMappingListener = (*nphdsCacheAdapter)(nil)
 
-func newNPHDSCacheAdapter(logger *slog.Logger, cache *cache.LinearCache) *nphdsCacheAdapter {
+func newNPHDSCacheAdapter(logger *slog.Logger, store nphdsResourceStore) *nphdsCacheAdapter {
 	return &nphdsCacheAdapter{
 		logger: logger,
-		cache:  cache,
+		store:  store,
 	}
 }
 
 // OnIPIdentityCacheChange pushes modifications to the IP<->Identity mapping
-// into the NPHDS LinearCache, mirroring the old NPHDSCache behaviour.
+// into ADS NPHDS resources, mirroring the old NPHDSCache behaviour.
 func (a *nphdsCacheAdapter) OnIPIdentityCacheChange(modType ipcache.CacheModification, cidrCluster cmtypes.PrefixCluster,
 	oldHostIP, newHostIP net.IP, oldID *ipcache.Identity, newID ipcache.Identity,
 	encryptKey uint8, k8sMeta *ipcache.K8sMetadata, endpointFlags uint8,
@@ -71,31 +74,17 @@ func (a *nphdsCacheAdapter) OnIPIdentityCacheChange(modType ipcache.CacheModific
 	}
 }
 
-func (a *nphdsCacheAdapter) updateFullState(mutate func(map[string]cache_types.Resource) (bool, error)) error {
+func (a *nphdsCacheAdapter) updateFullState(mutate func(map[string]*envoyAPI.NetworkPolicyHosts) (bool, error)) error {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	currentResources := a.cache.GetResources()
-	resources := make(map[string]cache_types.Resource, len(currentResources)+1)
-	maps.Copy(resources, currentResources)
-
-	changed, err := mutate(resources)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return nil
-	}
-
-	a.cache.SetResources(resources)
-	return nil
+	return a.store.updateNetworkPolicyHosts(context.Background(), mutate)
 }
 
 func (a *nphdsCacheAdapter) handleIPUpsert(identityStr, cidrStr string, newID identity.NumericIdentity) error {
-	return a.updateFullState(func(resources map[string]cache_types.Resource) (bool, error) {
+	return a.updateFullState(func(resources map[string]*envoyAPI.NetworkPolicyHosts) (bool, error) {
 		var hostAddresses []string
-		if res, ok := resources[identityStr]; ok {
-			npHost := res.(*envoyAPI.NetworkPolicyHosts)
+		if npHost, ok := resources[identityStr]; ok {
 			if slices.Contains(npHost.HostAddresses, cidrStr) {
 				return false, nil
 			}
@@ -120,12 +109,11 @@ func (a *nphdsCacheAdapter) handleIPUpsert(identityStr, cidrStr string, newID id
 }
 
 func (a *nphdsCacheAdapter) handleIPDelete(identityStr, cidrStr string) error {
-	return a.updateFullState(func(resources map[string]cache_types.Resource) (bool, error) {
-		res, ok := resources[identityStr]
+	return a.updateFullState(func(resources map[string]*envoyAPI.NetworkPolicyHosts) (bool, error) {
+		npHost, ok := resources[identityStr]
 		if !ok {
 			return false, nil
 		}
-		npHost := res.(*envoyAPI.NetworkPolicyHosts)
 
 		targetIndex := slices.Index(npHost.HostAddresses, cidrStr)
 		if targetIndex < 0 {
@@ -153,12 +141,46 @@ func (a *nphdsCacheAdapter) handleIPDelete(identityStr, cidrStr string) error {
 	})
 }
 
+func (s *adsServer) networkPolicyHosts() map[string]*envoyAPI.NetworkPolicyHosts {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	resources := s.cache.GetAllResources(localNodeID)
+	if resources == nil {
+		return nil
+	}
+	return resources.NetworkPolicyHosts
+}
+
+func (s *adsServer) updateNetworkPolicyHosts(ctx context.Context, mutate func(map[string]*envoyAPI.NetworkPolicyHosts) (bool, error)) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	currentResources := s.cache.GetAllResources(localNodeID)
+	if currentResources == nil {
+		empty := xds.NewResources()
+		currentResources = &empty
+	}
+	newResources := currentResources.DeepCopy()
+
+	changed, err := mutate(newResources.NetworkPolicyHosts)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+
+	return s.updateSnapshot(ctx, newResources, localNodeID, nil, nil,
+		computeChanges(currentResources, newResources))
+}
+
 // startNPHDSIPCacheListener starts listening to IPCache events and populating
-// the NPHDS LinearCache.
-func startNPHDSIPCacheListener(logger *slog.Logger, ipCache IPCacheEventSource, nphdsCache *cache.LinearCache) {
+// the ADS NPHDS resources.
+func startNPHDSIPCacheListener(logger *slog.Logger, ipCache IPCacheEventSource, store nphdsResourceStore) {
 	if ipCache == nil {
 		return
 	}
-	adapter := newNPHDSCacheAdapter(logger, nphdsCache)
+	adapter := newNPHDSCacheAdapter(logger, store)
 	ipCache.AddListener(adapter)
 }

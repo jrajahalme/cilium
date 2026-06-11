@@ -9,12 +9,14 @@ import (
 	"testing"
 
 	envoyAPI "github.com/cilium/proxy/go/cilium/api"
+	envoy_config_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	stream "github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/envoy/xdsnew"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipcache"
 )
@@ -22,18 +24,25 @@ import (
 func newTestNPHDSAdapter(t *testing.T) *nphdsCacheAdapter {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	lc := cache.NewLinearCache(NetworkPolicyHostsTypeURL)
-	return newNPHDSCacheAdapter(logger, lc)
+	server := newADSServerWithCache(xdsnew.NewCache(logger), logger, nil, nil, xdsServerConfig{}, nil, nil)
+	return newNPHDSCacheAdapter(logger, server)
 }
 
 func lookupNPHDS(t *testing.T, adapter *nphdsCacheAdapter, identityStr string) *envoyAPI.NetworkPolicyHosts {
 	t.Helper()
-	resources := adapter.cache.GetResources()
+	resources := adapter.store.networkPolicyHosts()
 	res, ok := resources[identityStr]
 	if !ok {
 		return nil
 	}
-	return res.(*envoyAPI.NetworkPolicyHosts)
+	return res
+}
+
+func testADSNPHDSCache(t *testing.T, adapter *nphdsCacheAdapter) xdsnew.Cache {
+	t.Helper()
+	server, ok := adapter.store.(*adsServer)
+	require.True(t, ok)
+	return server.cache
 }
 
 func TestNPHDSAdapterHandleIPUpsert(t *testing.T) {
@@ -178,13 +187,14 @@ func TestNPHDSAdapterPublishesFullStateResponses(t *testing.T) {
 	req := &cache.Request{
 		TypeUrl:       NetworkPolicyHostsTypeURL,
 		ResourceNames: []string{"*"},
+		Node:          &envoy_config_core.Node{Id: localNodeID},
 	}
 	subscription := stream.NewSotwSubscription(req.GetResourceNames(), false)
 
 	require.NoError(t, adapter.handleIPUpsert("100", "10.0.0.1/32", 100))
 
 	respChan := make(chan cache.Response, 1)
-	cancel, err := adapter.cache.CreateWatch(req, subscription, respChan)
+	cancel, err := testADSNPHDSCache(t, adapter).CreateWatch(req, subscription, respChan)
 	require.NoError(t, err)
 	require.NotNil(t, cancel)
 	defer cancel()
@@ -200,7 +210,7 @@ func TestNPHDSAdapterPublishesFullStateResponses(t *testing.T) {
 	require.NoError(t, adapter.handleIPUpsert("200", "10.0.0.2/32", 200))
 
 	respChan = make(chan cache.Response, 1)
-	cancel, err = adapter.cache.CreateWatch(req, subscription, respChan)
+	cancel, err = testADSNPHDSCache(t, adapter).CreateWatch(req, subscription, respChan)
 	require.NoError(t, err)
 	require.NotNil(t, cancel)
 	defer cancel()
@@ -215,14 +225,15 @@ func TestNPHDSAdapterPublishesFullStateResponses(t *testing.T) {
 
 func TestStartNPHDSIPCacheListener(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	lc := cache.NewLinearCache(NetworkPolicyHostsTypeURL)
+	adsCache := xdsnew.NewCache(logger)
+	server := newADSServerWithCache(adsCache, logger, nil, nil, xdsServerConfig{}, nil, nil)
 
 	// nil ipCache should be a no-op
-	startNPHDSIPCacheListener(logger, nil, lc)
+	startNPHDSIPCacheListener(logger, nil, server)
 
 	// With a mock ipCache, the adapter should be registered
 	mock := &mockIPCacheEventSource{}
-	startNPHDSIPCacheListener(logger, mock, lc)
+	startNPHDSIPCacheListener(logger, mock, server)
 	assert.Equal(t, 1, mock.listenerCount)
 }
 
