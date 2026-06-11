@@ -52,7 +52,7 @@ type cacheImpl struct {
 	resourcesInSnapshot map[string]*xds.Resources
 	logger              *slog.Logger
 	hasher              hash.Hash32
-	completionCbs       callbacks.CompletionCallbacks
+	completionCbs       *callbacks.CompletionCallbacks
 }
 
 var _ Cache = &cacheImpl{}
@@ -276,7 +276,7 @@ func (c *cacheImpl) GenerateSnapshot(resources *xds.Resources, logger *slog.Logg
 }
 
 func (c *cacheImpl) GetCompletionCallbacks() *callbacks.CompletionCallbacks {
-	return &c.completionCbs
+	return c.completionCbs
 }
 
 func (c *cacheImpl) SetResources(nodeID string, resources *xds.Resources) {
@@ -289,17 +289,35 @@ func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapsh
 	addCompletion := func(wg *completion.WaitGroup, cb func(err error)) *completion.Completion {
 		return wg.AddCompletionWithCallback(nil, cb)
 	}
+	type immediateCompletion struct {
+		comp                      *completion.Completion
+		typeURL                   string
+		err                       error
+		completeUnsentCompletions bool
+	}
 
 	completions := make([]*completion.Completion, 0, len(updatedTypeURLS))
-	immediateCompletions := make([]*completion.Completion, 0, 1)
+	immediateCompletions := make([]immediateCompletion, 0, 1)
 	if wg != nil && len(updatedTypeURLS) > 0 {
+		oldSnapshot, _ := c.GetSnapshot(nodeID)
 		for typeURL := range updatedTypeURLS {
 			comp := addCompletion(wg, callback)
 			if typeURL == NetworkPolicyTypeURL && len(newSnapshot.GetResources(NetworkPolicyTypeURL)) == 0 {
-				immediateCompletions = append(immediateCompletions, comp)
+				immediateCompletions = append(immediateCompletions, immediateCompletion{comp: comp})
 				continue
 			}
-			c.completionCbs.AddTypeVersionCompletion(comp, newSnapshot.GetVersion(typeURL), typeURL, nodeID, revertFunc)
+			version := newSnapshot.GetVersion(typeURL)
+			versionChanged := oldSnapshot == nil || oldSnapshot.GetVersion(typeURL) != version
+			registered, err := c.completionCbs.AddTypeVersionCompletion(comp, version, typeURL, nodeID, versionChanged, revertFunc)
+			if !registered {
+				immediateCompletions = append(immediateCompletions, immediateCompletion{
+					comp:                      comp,
+					typeURL:                   typeURL,
+					err:                       err,
+					completeUnsentCompletions: err == nil,
+				})
+				continue
+			}
 			completions = append(completions, comp)
 		}
 	}
@@ -311,8 +329,11 @@ func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapsh
 		}
 		return err
 	}
-	for _, comp := range immediateCompletions {
-		comp.Complete(nil)
+	for _, completion := range immediateCompletions {
+		if completion.completeUnsentCompletions {
+			c.completionCbs.CompleteUnsentPendingCompletions(nodeID, completion.typeURL, nil)
+		}
+		completion.comp.Complete(completion.err)
 	}
 
 	return nil

@@ -20,12 +20,14 @@ import (
 	envoy_config_listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	envoy_resource "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
 
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/envoy/xds"
+	callbacks "github.com/cilium/cilium/pkg/envoy/xdsnew/callbacks"
 	"github.com/cilium/cilium/pkg/lock"
 )
 
@@ -120,6 +122,7 @@ func newTestCache(mockedCache *mockSnapshotCache) cacheImpl {
 		resourcesInSnapshot: make(map[string]*xds.Resources),
 		logger:              logger,
 		hasher:              nil, // not needed for tests that don't call hash/GetVersion
+		completionCbs:       callbacks.NewCompletionCallbacks(logger),
 	}
 }
 
@@ -140,6 +143,68 @@ func emptyResources() *xds.Resources {
 		NetworkPolicies:    make(map[string]*cilium.NetworkPolicy),
 		NetworkPolicyHosts: make(map[string]*cilium.NetworkPolicyHosts),
 	}
+}
+
+func networkPolicySnapshot(t *testing.T, c *cacheImpl, endpointID uint64) (*xds.Resources, cache.ResourceSnapshot) {
+	t.Helper()
+
+	resources := emptyResources()
+	resources.NetworkPolicies["np1"] = &cilium.NetworkPolicy{EndpointId: endpointID}
+	snap, err := c.GenerateSnapshot(resources, c.logger)
+	require.NoError(t, err)
+	return resources, snap
+}
+
+func listenerSnapshot(t *testing.T, c *cacheImpl, name string) (*xds.Resources, cache.ResourceSnapshot) {
+	t.Helper()
+
+	resources := emptyResources()
+	resources.Listeners[name] = &envoy_config_listener.Listener{Name: name}
+	snap, err := c.GenerateSnapshot(resources, c.logger)
+	require.NoError(t, err)
+	return resources, snap
+}
+
+func ackNetworkPolicyVersion(t *testing.T, c *cacheImpl, nodeID, version string) {
+	t.Helper()
+
+	node := &envoy_config_core.Node{Id: nodeID}
+	c.completionCbs.OnStreamResponse(context.Background(), 1,
+		&discovery.DiscoveryRequest{
+			Node:    node,
+			TypeUrl: NetworkPolicyTypeURL,
+		},
+		&discovery.DiscoveryResponse{
+			VersionInfo: version,
+			TypeUrl:     NetworkPolicyTypeURL,
+		})
+	err := c.completionCbs.OnStreamRequest(1, &discovery.DiscoveryRequest{
+		Node:        node,
+		TypeUrl:     NetworkPolicyTypeURL,
+		VersionInfo: version,
+	})
+	require.NoError(t, err)
+}
+
+func ackListenerVersion(t *testing.T, c *cacheImpl, nodeID, version string) {
+	t.Helper()
+
+	node := &envoy_config_core.Node{Id: nodeID}
+	c.completionCbs.OnStreamResponse(context.Background(), 1,
+		&discovery.DiscoveryRequest{
+			Node:    node,
+			TypeUrl: envoy_resource.ListenerType,
+		},
+		&discovery.DiscoveryResponse{
+			VersionInfo: version,
+			TypeUrl:     envoy_resource.ListenerType,
+		})
+	err := c.completionCbs.OnStreamRequest(1, &discovery.DiscoveryRequest{
+		Node:        node,
+		TypeUrl:     envoy_resource.ListenerType,
+		VersionInfo: version,
+	})
+	require.NoError(t, err)
 }
 
 func TestNewCache(t *testing.T) {
@@ -433,6 +498,103 @@ func TestUpdateSnapshot_RegistersNetworkPolicyCompletionForPolicyChange(t *testi
 
 	assert.Equal(t, 1, c.completionCbs.PendingCompletionCount())
 	c.completionCbs.CancelPendingCompletions(NetworkPolicyTypeURL)
+}
+
+func TestUpdateSnapshot_CompletesAlreadyAckedNetworkPolicyVersion(t *testing.T) {
+	mock := newMockSnapshotCache()
+	c := newTestCacheWithHasher(mock)
+
+	const nodeID = "node1"
+	_, snap := networkPolicySnapshot(t, c, 1)
+
+	err := c.UpdateSnapshot(context.Background(), nodeID, snap, nil,
+		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, nil)
+	require.NoError(t, err)
+	ackNetworkPolicyVersion(t, c, nodeID, snap.GetVersion(NetworkPolicyTypeURL))
+
+	var callbackErrs []error
+	wg := completion.NewWaitGroup(context.Background())
+	defer wg.Cancel()
+
+	err = c.UpdateSnapshot(context.Background(), nodeID, snap, wg,
+		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, func(err error) {
+			callbackErrs = append(callbackErrs, err)
+		})
+	require.NoError(t, err)
+
+	assert.Zero(t, c.completionCbs.PendingCompletionCount())
+	require.NoError(t, wg.Wait())
+	require.Len(t, callbackErrs, 1)
+	assert.NoError(t, callbackErrs[0])
+}
+
+func TestUpdateSnapshot_CompletesAlreadyAckedListenerVersion(t *testing.T) {
+	mock := newMockSnapshotCache()
+	c := newTestCacheWithHasher(mock)
+
+	const nodeID = "node1"
+	_, snap := listenerSnapshot(t, c, "listener1")
+
+	err := c.UpdateSnapshot(context.Background(), nodeID, snap, nil, nil, nil)
+	require.NoError(t, err)
+	ackListenerVersion(t, c, nodeID, snap.GetVersion(envoy_resource.ListenerType))
+
+	var callbackErrs []error
+	wg := completion.NewWaitGroup(context.Background())
+	defer wg.Cancel()
+
+	err = c.UpdateSnapshot(context.Background(), nodeID, snap, wg,
+		map[string]func(error){envoy_resource.ListenerType: func(err error) {
+			callbackErrs = append(callbackErrs, err)
+		}}, nil)
+	require.NoError(t, err)
+
+	assert.Zero(t, c.completionCbs.PendingCompletionCount())
+	require.NoError(t, wg.Wait())
+	require.Len(t, callbackErrs, 1)
+	assert.NoError(t, callbackErrs[0])
+}
+
+func TestUpdateSnapshot_CompletesUnsentCoalescedNetworkPolicyUpdates(t *testing.T) {
+	mock := newMockSnapshotCache()
+	c := newTestCacheWithHasher(mock)
+
+	const nodeID = "node1"
+	_, snapA := networkPolicySnapshot(t, c, 1)
+	_, snapB := networkPolicySnapshot(t, c, 2)
+	require.NotEqual(t, snapA.GetVersion(NetworkPolicyTypeURL), snapB.GetVersion(NetworkPolicyTypeURL))
+
+	err := c.UpdateSnapshot(context.Background(), nodeID, snapA, nil,
+		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, nil)
+	require.NoError(t, err)
+	ackNetworkPolicyVersion(t, c, nodeID, snapA.GetVersion(NetworkPolicyTypeURL))
+
+	var bCallbackErrs []error
+	wgB := completion.NewWaitGroup(context.Background())
+	defer wgB.Cancel()
+	err = c.UpdateSnapshot(context.Background(), nodeID, snapB, wgB,
+		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, func(err error) {
+			bCallbackErrs = append(bCallbackErrs, err)
+		})
+	require.NoError(t, err)
+	require.Equal(t, 1, c.completionCbs.PendingCompletionCount())
+
+	var aCallbackErrs []error
+	wgA := completion.NewWaitGroup(context.Background())
+	defer wgA.Cancel()
+	err = c.UpdateSnapshot(context.Background(), nodeID, snapA, wgA,
+		map[string]struct{}{NetworkPolicyTypeURL: {}}, nil, func(err error) {
+			aCallbackErrs = append(aCallbackErrs, err)
+		})
+	require.NoError(t, err)
+
+	assert.Zero(t, c.completionCbs.PendingCompletionCount())
+	require.NoError(t, wgB.Wait())
+	require.NoError(t, wgA.Wait())
+	require.Len(t, bCallbackErrs, 1)
+	assert.NoError(t, bCallbackErrs[0])
+	require.Len(t, aCallbackErrs, 1)
+	assert.NoError(t, aCallbackErrs[0])
 }
 
 // --- GetVersion ---
