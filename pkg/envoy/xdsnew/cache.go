@@ -171,7 +171,7 @@ func snapshotCacheLogger(logger *slog.Logger) controlplanelog.Logger {
 }
 
 func NewCache(logger *slog.Logger) Cache {
-	snapshotCache := cache.NewSnapshotCache( /*ads*/ true, cache.IDHash{}, snapshotCacheLogger(logger))
+	snapshotCache := cache.NewSnapshotCache( /*ads*/ false, cache.IDHash{}, snapshotCacheLogger(logger))
 
 	return &cacheImpl{
 		SnapshotCache:       snapshotCache,
