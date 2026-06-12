@@ -323,9 +323,12 @@ func (s *adsServer) addListener(ctx context.Context, name string, listenerConf f
 	}
 	oldListener, existed := resources.Listeners[name]
 	resources.Listeners[name] = listenerConfig
-	return s.updateSnapshot(ctx, resources, localNodeID, wg, nil,
-		&resourceChanges{listeners: []savedEntry[*envoy_config_listener.Listener]{{key: name, value: oldListener, existed: existed}}},
-		cb)
+	var callbackTypeURLs map[string]func(error)
+	if cb != nil {
+		callbackTypeURLs = map[string]func(error){ListenerTypeURL: cb}
+	}
+	return s.updateSnapshot(ctx, resources, localNodeID, wg, callbackTypeURLs,
+		&resourceChanges{listeners: []savedEntry[*envoy_config_listener.Listener]{{key: name, value: oldListener, existed: existed}}})
 }
 
 func (s *adsServer) getAdminListenerConfig(port uint16) *envoy_config_listener.Listener {
@@ -632,13 +635,12 @@ func (s *adsServer) UpdateNetworkPolicy(ctx context.Context, ep endpoint.Endpoin
 		resources = resources.DeepCopy()
 		oldPolicy, existed := resources.NetworkPolicies[resourceName]
 		resources.NetworkPolicies[resourceName] = networkPolicy
-		var snapshotCallback func(error)
+		var callbackTypeURLs map[string]func(error)
 		if waitForACK {
-			snapshotCallback = callback
+			callbackTypeURLs = map[string]func(error){NetworkPolicyTypeURL: callback}
 		}
-		if err := s.updateSnapshot(ctx, resources, nodeId, wg, nil,
-			&resourceChanges{networkPolicies: []savedEntry[*cilium.NetworkPolicy]{{key: resourceName, value: oldPolicy, existed: existed}}},
-			snapshotCallback); err != nil {
+		if err := s.updateSnapshot(ctx, resources, nodeId, wg, callbackTypeURLs,
+			&resourceChanges{networkPolicies: []savedEntry[*cilium.NetworkPolicy]{{key: resourceName, value: oldPolicy, existed: existed}}}); err != nil {
 			return err, nil, nil
 		}
 	}
@@ -921,7 +923,7 @@ func applyDiff[V any](dst map[string]V, entries []savedEntry[V]) {
 }
 
 // Caller must hold s.mutex.
-func (s *adsServer) updateSnapshot(ctx context.Context, resources *xds.Resources, nodeId string, wg *completion.WaitGroup, updatedTypeURLs map[string]struct{}, changes *resourceChanges, callback ...func(err error)) error {
+func (s *adsServer) updateSnapshot(ctx context.Context, resources *xds.Resources, nodeId string, wg *completion.WaitGroup, callbackTypeURLs map[string]func(err error), changes *resourceChanges) error {
 	if nodeId == "" {
 		// Host proxy uses "127.0.0.1" as the nodeID
 		nodeId = localNodeID
@@ -992,8 +994,12 @@ func (s *adsServer) updateSnapshot(ctx context.Context, resources *xds.Resources
 	updatedTypeURLsInSnapshot := getUpdatedTypeURLs(changes)
 	// Callers can explicitly add type URLs when the changed type cannot be
 	// inferred from the changed resource entries.
-	if updatedTypeURLs != nil {
-		maps.Copy(updatedTypeURLsInSnapshot, updatedTypeURLs)
+	if callbackTypeURLs != nil {
+		if updatedTypeURLsInSnapshot == nil {
+			updatedTypeURLsInSnapshot = callbackTypeURLs
+		} else {
+			maps.Copy(updatedTypeURLsInSnapshot, callbackTypeURLs)
+		}
 	}
 	newSnapshot, err := s.cache.GenerateSnapshot(resources, s.logger)
 	if err != nil {
@@ -1011,11 +1017,7 @@ func (s *adsServer) updateSnapshot(ctx context.Context, resources *xds.Resources
 		if wg != nil {
 			revertFunc = s.buildRevert(ctx, nodeId, resources, changes)
 		}
-		var cb func(err error)
-		if len(callback) > 0 {
-			cb = callback[0]
-		}
-		err = s.cache.UpdateSnapshot(ctx, nodeId, newSnapshot, wg, updatedTypeURLsInSnapshot, revertFunc, cb)
+		err = s.cache.UpdateSnapshot(ctx, nodeId, newSnapshot, wg, updatedTypeURLsInSnapshot, revertFunc)
 		if err != nil {
 			s.logger.Error("Error setting snapshot for node %s: %q",
 				logfields.NodeID, nodeId,
@@ -1065,10 +1067,14 @@ func (s *adsServer) UpsertEnvoyResources(ctx context.Context, resources xds.Reso
 	// Merge new resources into a copy of current resources (upsert semantics).
 	merged := currentResources.DeepCopy()
 	mergeResources(merged, &resources)
+	changes := computeChanges(currentResources, merged)
 
-	return s.updateSnapshot(ctx, merged, "", wg, nil,
-		computeChanges(currentResources, merged),
-		s.portAllocationCallback(ctx, resources.PortAllocationCallbacks))
+	callback := s.portAllocationCallback(ctx, resources.PortAllocationCallbacks)
+	var callbackTypeURLs map[string]func(error)
+	if callback != nil {
+		callbackTypeURLs = map[string]func(error){ListenerTypeURL: callback}
+	}
+	return s.updateSnapshot(ctx, merged, "", wg, callbackTypeURLs, changes)
 }
 
 func (s *adsServer) UpdateEnvoyResources(ctx context.Context, oldResources, newResources xds.Resources, waitGroup *completion.WaitGroup) error {
@@ -1100,10 +1106,14 @@ func (s *adsServer) UpdateEnvoyResources(ctx context.Context, oldResources, newR
 	// Subtract old resources and merge new resources (update semantics).
 	updated := subtractResources(currentResources, &oldResources)
 	mergeResources(&updated, &newResources)
+	changes := computeChanges(currentResources, &updated)
 
-	return s.updateSnapshot(ctx, &updated, "", waitGroup, nil,
-		computeChanges(currentResources, &updated),
-		s.portAllocationCallback(ctx, newResources.PortAllocationCallbacks))
+	callback := s.portAllocationCallback(ctx, newResources.PortAllocationCallbacks)
+	var callbackTypeURLs map[string]func(error)
+	if callback != nil {
+		callbackTypeURLs = map[string]func(error){ListenerTypeURL: callback}
+	}
+	return s.updateSnapshot(ctx, &updated, "", waitGroup, callbackTypeURLs, changes)
 }
 
 func (s *adsServer) DeleteEnvoyResources(ctx context.Context, resources xds.Resources, waitGroup *completion.WaitGroup) error {
@@ -1125,14 +1135,20 @@ func (s *adsServer) DeleteEnvoyResources(ctx context.Context, resources xds.Reso
 	newResources := subtractResources(currentResources, &resources)
 
 	// For now we only care about listeners, to match the existing (pre ADS) implementation of xds server.
-	updatedTypeURLs := make(map[string]struct{})
+	var callbackTypeURLs map[string]func(error)
 	if len(currentResources.Listeners) != len(newResources.Listeners) {
-		updatedTypeURLs[ListenerTypeURL] = struct{}{}
+		callbackTypeURLs = map[string]func(error){ListenerTypeURL: nil}
 	}
+	changes := computeChanges(currentResources, &newResources)
 
-	return s.updateSnapshot(ctx, &newResources, "", waitGroup, updatedTypeURLs,
-		computeChanges(currentResources, &newResources),
-		s.portAllocationCallback(ctx, resources.PortAllocationCallbacks))
+	callback := s.portAllocationCallback(ctx, resources.PortAllocationCallbacks)
+	if callback != nil {
+		if callbackTypeURLs == nil {
+			callbackTypeURLs = map[string]func(error){}
+		}
+		callbackTypeURLs[ListenerTypeURL] = callback
+	}
+	return s.updateSnapshot(ctx, &newResources, "", waitGroup, callbackTypeURLs, changes)
 }
 
 // mergeResources copies all resources from src into dst (upsert semantics).
@@ -1224,31 +1240,37 @@ func (s *adsServer) getNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamed
 	return p
 }
 
-func getUpdatedTypeURLs(changes *resourceChanges) map[string]struct{} {
-	updatedTypeURLS := make(map[string]struct{})
+func getUpdatedTypeURLs(changes *resourceChanges) map[string]func(error) {
 	if changes == nil {
-		return updatedTypeURLS
+		return nil
+	}
+	var updatedTypeURLS map[string]func(error)
+	add := func(typeURL string) {
+		if updatedTypeURLS == nil {
+			updatedTypeURLS = make(map[string]func(error))
+		}
+		updatedTypeURLS[typeURL] = nil
 	}
 	if len(changes.listeners) > 0 {
-		updatedTypeURLS[ListenerTypeURL] = struct{}{}
+		add(ListenerTypeURL)
 	}
 	if len(changes.routes) > 0 {
-		updatedTypeURLS[RouteTypeURL] = struct{}{}
+		add(RouteTypeURL)
 	}
 	if len(changes.clusters) > 0 {
-		updatedTypeURLS[ClusterTypeURL] = struct{}{}
+		add(ClusterTypeURL)
 	}
 	if len(changes.endpoints) > 0 {
-		updatedTypeURLS[EndpointTypeURL] = struct{}{}
+		add(EndpointTypeURL)
 	}
 	if len(changes.secrets) > 0 {
-		updatedTypeURLS[SecretTypeURL] = struct{}{}
+		add(SecretTypeURL)
 	}
 	if len(changes.networkPolicies) > 0 {
-		updatedTypeURLS[NetworkPolicyTypeURL] = struct{}{}
+		add(NetworkPolicyTypeURL)
 	}
 	if len(changes.networkPolicyHosts) > 0 {
-		updatedTypeURLS[NetworkPolicyHostsTypeURL] = struct{}{}
+		add(NetworkPolicyHostsTypeURL)
 	}
 	return updatedTypeURLS
 }

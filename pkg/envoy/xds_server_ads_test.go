@@ -35,6 +35,7 @@ import (
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_config_http "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	envoy_service_discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 )
 
 var (
@@ -409,6 +410,58 @@ func TestUpdateEnvoyResources(t *testing.T) {
 	require.NotNil(t, resources.Endpoints["endpoint1"])
 	require.Len(t, resources.NetworkPolicies, 1)
 	require.NotNil(t, resources.NetworkPolicies["40"])
+}
+
+func TestUpdateEnvoyResourcesWaitsForListenerACKWithPortAllocationCallback(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	config := xdsServerConfig{
+		envoySocketDir:       t.TempDir(),
+		policyRestoreTimeout: 30 * time.Second,
+	}
+	cache := xdsnew.NewCache(logger)
+	server := newADSServerWithCache(cache, logger, nil, nil, config, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	resources := xds.NewResources()
+	resources.Listeners["listener1"] = DEFAULT_RESOURCES.Listeners["listener1"]
+	var callbackCount atomic.Uint64
+	resources.PortAllocationCallbacks["listener1"] = func(context.Context) error {
+		callbackCount.Add(1)
+		return nil
+	}
+
+	wg := completion.NewWaitGroup(ctx)
+	require.NoError(t, server.UpdateEnvoyResources(ctx, xds.NewResources(), resources, wg))
+
+	require.Eventually(t, func() bool {
+		return cache.GetCompletionCallbacks().PendingCompletionCount() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, uint64(0), callbackCount.Load())
+
+	snapshot, err := cache.GetSnapshot(localNodeID)
+	require.NoError(t, err)
+	version := snapshot.GetVersion(ListenerTypeURL)
+	require.NotEmpty(t, version)
+
+	req := &envoy_service_discovery.DiscoveryRequest{
+		Node:    &envoy_config_core_v3.Node{Id: localNodeID},
+		TypeUrl: ListenerTypeURL,
+	}
+	resp := &envoy_service_discovery.DiscoveryResponse{
+		TypeUrl:     ListenerTypeURL,
+		VersionInfo: version,
+	}
+	cache.GetCompletionCallbacks().OnStreamResponse(context.Background(), 1, req, resp)
+	require.NoError(t, cache.GetCompletionCallbacks().OnStreamRequest(1, &envoy_service_discovery.DiscoveryRequest{
+		Node:        &envoy_config_core_v3.Node{Id: localNodeID},
+		TypeUrl:     ListenerTypeURL,
+		VersionInfo: version,
+	}))
+
+	require.NoError(t, wg.Wait())
+	require.Equal(t, uint64(1), callbackCount.Load())
+	require.Equal(t, 0, cache.GetCompletionCallbacks().PendingCompletionCount())
 }
 
 func TestDeleteEnvoyResources(t *testing.T) {

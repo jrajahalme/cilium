@@ -36,7 +36,7 @@ type Cache interface {
 
 	GetVersion(resources *xds.Resources) string
 	GenerateSnapshot(resources *xds.Resources, logger *slog.Logger) (cache.ResourceSnapshot, error)
-	UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error
+	UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]func(err error), revertFunc func()) error
 	SetResources(nodeID string, resources *xds.Resources)
 	GetAllResources(nodeID string) *xds.Resources
 	AreDifferentSnapshots(left, right cache.ResourceSnapshot) bool
@@ -285,10 +285,7 @@ func (c *cacheImpl) SetResources(nodeID string, resources *xds.Resources) {
 	c.resourcesInSnapshot[nodeID] = resources
 }
 
-func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]struct{}, revertFunc func(), callback func(err error)) error {
-	addCompletion := func(wg *completion.WaitGroup, cb func(err error)) *completion.Completion {
-		return wg.AddCompletionWithCallback(nil, cb)
-	}
+func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]func(err error), revertFunc func()) error {
 	type immediateCompletion struct {
 		comp                      *completion.Completion
 		typeURL                   string
@@ -300,8 +297,8 @@ func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapsh
 	immediateCompletions := make([]immediateCompletion, 0, 1)
 	if wg != nil && len(updatedTypeURLS) > 0 {
 		oldSnapshot, _ := c.GetSnapshot(nodeID)
-		for typeURL := range updatedTypeURLS {
-			comp := addCompletion(wg, callback)
+		for typeURL, completionCallback := range updatedTypeURLS {
+			comp := wg.AddCompletionWithCallback(nil, completionCallback)
 			if typeURL == NetworkPolicyTypeURL && len(newSnapshot.GetResources(NetworkPolicyTypeURL)) == 0 {
 				immediateCompletions = append(immediateCompletions, immediateCompletion{comp: comp})
 				continue
