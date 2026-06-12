@@ -16,6 +16,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	cache_types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	controlplanelog "github.com/envoyproxy/go-control-plane/pkg/log"
 	envoy_resource "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"k8s.io/apimachinery/pkg/util/rand"
 
@@ -147,8 +148,30 @@ func (w *ciliumSnapshot) GetVersionMap(typeURL string) map[string]string {
 	return w.VersionMap[typeURL]
 }
 
+func snapshotCacheLogger(logger *slog.Logger) controlplanelog.Logger {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With("component", "go-control-plane-snapshot-cache")
+	return controlplanelog.LoggerFuncs{
+		DebugFunc: func(format string, args ...interface{}) {
+			logger.Debug(fmt.Sprintf(format, args...))
+		},
+		InfoFunc: func(format string, args ...interface{}) {
+			// Consider using Debug here if Info is too chatty
+			logger.Info(fmt.Sprintf(format, args...))
+		},
+		WarnFunc: func(format string, args ...interface{}) {
+			logger.Warn(fmt.Sprintf(format, args...))
+		},
+		ErrorFunc: func(format string, args ...interface{}) {
+			logger.Error(fmt.Sprintf(format, args...))
+		},
+	}
+}
+
 func NewCache(logger *slog.Logger) Cache {
-	snapshotCache := cache.NewSnapshotCache( /*ads*/ true, cache.IDHash{} /*logger*/, nil)
+	snapshotCache := cache.NewSnapshotCache( /*ads*/ true, cache.IDHash{}, snapshotCacheLogger(logger))
 
 	return &cacheImpl{
 		SnapshotCache:       snapshotCache,
